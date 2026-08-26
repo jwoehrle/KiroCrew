@@ -4102,10 +4102,15 @@ class TestSsmValidation:
         assert validate_aws_profile("") == ""
         assert validate_aws_region("") == ""
         assert validate_aws_profile("my-profile_1.x") == "my-profile_1.x"
+        # '+' is valid in AWS profile names (SSO derives them as
+        # ``<account>+<permission-set>``), so it must be accepted.
+        assert validate_aws_profile("AdminAccess+dev") == "AdminAccess+dev"
+        assert validate_aws_profile("123456789012+PowerUser") == "123456789012+PowerUser"
         assert validate_aws_region("us-east-1") == "us-east-1"
         assert validate_aws_region("us-gov-west-1") == "us-gov-west-1"
         # Option injection + metacharacters + bogus region shapes are refused.
-        for bad in ("-oProxyCommand=x", "a b", "a;b", "a$(b)"):
+        # A leading '+' is fine, but a leading '-' is still option injection.
+        for bad in ("-oProxyCommand=x", "a b", "a;b", "a$(b)", "-dev"):
             with pytest.raises(SsmValidationError):
                 validate_aws_profile(bad)
         for bad in ("useast1", "US-EAST-1", "us-east-1; rm -rf /", "-us-east-1"):
@@ -4193,6 +4198,27 @@ class TestSsmRegistry:
         reloaded = self._reg(tmp_path).get(inst.id)
         assert reloaded.connection_method == "ssm"
         assert reloaded.ssm_target == "i-0123456789abcdef0"
+
+    def test_add_ssm_instance_accepts_profile_with_plus(self, tmp_path):
+        """AWS profile names may contain '+' (common for SSO-derived names).
+
+        A '+' and interior '-' are both legal; only a *leading* '-' is refused
+        (option injection), so an SSO name like ``user+demo-space-Admin`` must
+        round-trip unchanged.
+        """
+        reg = self._reg(tmp_path)
+        inst = reg.add(
+            name="SSO Box",
+            connection_method="ssm",
+            ssm_target="i-0123456789abcdef0",
+            aws_profile="user+demo-space-Admin",
+            aws_region="eu-west-2",
+            remote_port=7777,
+        )
+        assert inst.aws_profile == "user+demo-space-Admin"
+        # Round-trips through disk unchanged.
+        reloaded = self._reg(tmp_path).get(inst.id)
+        assert reloaded.aws_profile == "user+demo-space-Admin"
 
     def test_ssm_requires_target_and_ssh_requires_host(self, tmp_path):
         from kiro_crew.instances.registry import InvalidInstanceError

@@ -50,7 +50,10 @@ _DEFAULT_SSM_RUN_AS = "ec2-user"
 
 # aws_profile: a named profile from ~/.aws/config. Conservative charset (no
 # shell metacharacters, no leading '-' to avoid being parsed as an option).
-_AWS_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}\Z")
+# '+' is included because AWS allows it in profile names and IAM Identity Center
+# (SSO) commonly derives them as ``<account>+<permission-set>``; it is neither a
+# shell metacharacter nor an option prefix, so admitting it is injection-safe.
+_AWS_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.+-]{1,128}\Z")
 
 # aws_region: standard AWS region shape (e.g. us-east-1, us-gov-west-1).
 _AWS_REGION_RE = re.compile(r"^[a-z]{2}(-gov)?-[a-z]+-\d{1,2}\Z")
@@ -184,7 +187,7 @@ def validate_aws_profile(aws_profile: str) -> str:
     if not _AWS_PROFILE_RE.match(profile):
         raise SsmValidationError(
             f"aws_profile {profile!r} contains invalid characters "
-            f"(allowed: letters, digits, '.', '_', '-')"
+            f"(allowed: letters, digits, '.', '_', '+', '-')"
         )
     return profile
 

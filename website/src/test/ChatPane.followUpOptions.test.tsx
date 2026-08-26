@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { ReactNode } from 'react'
-import { act, render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import type { RootState } from '../store'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -42,6 +42,7 @@ vi.mock('../api/client', () => ({
     fileSearch: vi.fn().mockResolvedValue({ root: '/repo', results: [] }),
     chatSlotAgent: vi.fn().mockResolvedValue(undefined),
     dashboardConfig: vi.fn().mockResolvedValue({ quick_send: false }),
+    planAction: vi.fn().mockResolvedValue({ ok: true }),
   },
   SEARCH_MIN_CHARS: 2,
   ApiError: class ApiError extends Error {
@@ -72,9 +73,24 @@ import { api } from '../api/client'
 /** The marker has to close its own line for OPTION_MARKER_RE to match. */
 const ASSISTANT_WITH_OPTIONS = 'Ready to proceed.\n\n[OPTIONS: Alpha | Beta]'
 
+/** A plan needs BOTH the header and a stage line for parseOptions to set isPlan.
+ *  The footer mirrors the plan pipeline's template exactly: every plan that
+ *  reaches a transcript is normalized to `[OPTION: Go | Go All | Cancel]`, and
+ *  those are also the only actions the plan endpoint accepts. */
+const ASSISTANT_WITH_PLAN = '📋 Plan for: ship it\n\nStage 1: build the thing\n\n[OPTION: Go | Go All | Cancel]'
+
+/** Plan-SHAPED (header + stage line) but carrying non-protocol labels — e.g. an
+ *  agent quoting a plan while offering its own choices. Must keep the composer path. */
+const ASSISTANT_PLAN_SHAPED_CUSTOM = '📋 Plan for: ship it\n\nStage 1: build the thing\n\n[OPTIONS: Approve it | Revise stage 2]'
+
 const PANE_MESSAGES = [
   { role: 'user', content: 'hi', ts: '2026-08-25T00:00:00Z' },
   { role: 'assistant', content: ASSISTANT_WITH_OPTIONS, ts: '2026-08-25T00:00:01Z' },
+]
+
+const PLAN_MESSAGES = [
+  { role: 'user', content: 'plan it', ts: '2026-08-25T00:00:00Z' },
+  { role: 'assistant', content: ASSISTANT_WITH_PLAN, ts: '2026-08-25T00:00:01Z' },
 ]
 
 function makeStore(slotKey: string, slotExtra: Record<string, unknown> = {}) {
@@ -91,8 +107,8 @@ function makeStore(slotKey: string, slotExtra: Record<string, unknown> = {}) {
   })
 }
 
-async function renderPane(slotKey: string, slotExtra: Record<string, unknown> = {}) {
-  ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockResolvedValue({ messages: PANE_MESSAGES, running: false, has_more: false, total: PANE_MESSAGES.length })
+async function renderPane(slotKey: string, slotExtra: Record<string, unknown> = {}, messages = PANE_MESSAGES) {
+  ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockResolvedValue({ messages, running: false, has_more: false, total: messages.length })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const store = makeStore(slotKey, slotExtra)
   await act(async () => {
@@ -109,7 +125,8 @@ async function renderPane(slotKey: string, slotExtra: Record<string, unknown> = 
     )
   })
   // Hydration is settled once the transcript shows the assistant's prose.
-  await waitFor(() => expect(screen.getByText(/Ready to proceed/)).toBeTruthy())
+  const settled = messages.some(m => m.content.includes('Plan for')) ? /Plan for: ship it/ : /Ready to proceed/
+  await waitFor(() => expect(screen.getByText(settled)).toBeTruthy())
   return store
 }
 
@@ -214,5 +231,211 @@ describe('ChatPane follow-up options (issue #5870)', () => {
     // gone, so the null above proves the gate, not an unrelated render break.
     await act(async () => { store.dispatch(clearQuestionCard({ slot: 'pane-5' })) })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Alpha' })).toBeTruthy())
+  })
+})
+
+describe('ChatPane plan follow-ups dispatch (issue #5893)', () => {
+  it('a plan chip in an orchestrator pane dispatches the plan action and never touches the composer', async () => {
+    await renderPane('pane-plan-1', { mode: 'orchestrator' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    expect(api.planAction).toHaveBeenCalledTimes(1)
+    expect(api.planAction).toHaveBeenCalledWith('pane-plan-1', 'Go')
+    // The label must NOT fall through to the composer-append path: before the
+    // fix the click typed the literal label into the composer, one Enter away
+    // from being sent to the agent as an ordinary chat message.
+    expect(composer().value).toBe('')
+    expect(api.sendChat).not.toHaveBeenCalled()
+  })
+
+  it('a NON-plan chip in an orchestrator pane still appends to the composer (plain follow-ups unaffected)', async () => {
+    await renderPane('pane-plan-2', { mode: 'orchestrator' }, PANE_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Alpha' })).toBeTruthy())
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Alpha') })
+    expect(composer().value).toBe('Alpha')
+    expect(api.planAction).not.toHaveBeenCalled()
+  })
+
+  it('a plan-shaped chip outside orchestrator mode falls through to the composer (same mode gate as ChatPage)', async () => {
+    await renderPane('pane-plan-3', { mode: '' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    expect(composer().value).toBe('Go')
+    expect(api.planAction).not.toHaveBeenCalled()
+  })
+
+  it('a plan-shaped message with NON-protocol labels keeps the composer path (allowlist gate)', async () => {
+    // The endpoint accepts only go / go all / cancel; dispatching anything
+    // else would 400 server-side while the append path was already skipped —
+    // a dead chip. Such a message is reachable: an agent quoting a plan while
+    // offering its own choices trips the plan-shape detector.
+    const custom = [
+      { role: 'user', content: 'plan it', ts: '2026-08-25T00:00:00Z' },
+      { role: 'assistant', content: ASSISTANT_PLAN_SHAPED_CUSTOM, ts: '2026-08-25T00:00:01Z' },
+    ]
+    await renderPane('pane-plan-6', { mode: 'orchestrator' }, custom)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Approve it' })).toBeTruthy())
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Approve it') })
+    expect(composer().value).toBe('Approve it')
+    expect(api.planAction).not.toHaveBeenCalled()
+  })
+
+  it('a plan chip is a NO-OP while the slot record is unresolved (never appends an approval label)', async () => {
+    // On a reload with a restored grid the pane hydrates its transcript from
+    // the detail fetch before the first WS slots snapshot lands, so paneSlot
+    // can be undefined while the chips are already clickable. The mode is
+    // unknown in that window: dispatching is unsafe (the slot may not be an
+    // orchestrator) and appending re-creates the reported bug — so the click
+    // must do nothing at all.
+    ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockResolvedValue({ messages: PLAN_MESSAGES, running: false, has_more: false, total: PLAN_MESSAGES.length })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const store = configureStore({
+      reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
+      preloadedState: {
+        dashboard: {
+          status: null, connected: true,
+          slots: [], // first slots snapshot not yet delivered
+          unreadSlots: [], refreshTrigger: 0, approvalMode: 'normal',
+          subagentRunning: {}, subagentDetails: {}, subagentText: {},
+        } as unknown as RootState['dashboard'],
+      } as Partial<RootState>,
+    })
+    await act(async () => {
+      render(
+        <Provider store={store}>
+          <QueryClientProvider client={qc}>
+            <ThemeProvider>
+              <MemoryRouter>
+                <ChatPane slotKey="pane-plan-7" />
+              </MemoryRouter>
+            </ThemeProvider>
+          </QueryClientProvider>
+        </Provider>,
+      )
+    })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    expect(api.planAction).not.toHaveBeenCalled()
+    expect(composer().value).toBe('')
+  })
+
+  it('a second click while the dispatch is pending does not fire twice (re-entrancy across renders)', async () => {
+    // Never-resolving promise keeps the mutation pending across both clicks.
+    ;(api.planAction as ReturnType<typeof vi.fn>).mockImplementation(() => new Promise(() => {}))
+    await renderPane('pane-plan-4', { mode: 'orchestrator' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    await act(async () => { clickOption('Go') })
+    expect(api.planAction).toHaveBeenCalledTimes(1)
+  })
+
+  it('two stage-advancing chips landing in the SAME tick dispatch once (synchronous latch)', async () => {
+    // `mutation.isPending` is a render snapshot: two onSelect callbacks firing
+    // before the next render both read false. Without a synchronous latch a
+    // rapid Go followed by Go All submits two stage-advancing actions and the
+    // plan advances an extra stage. Both debounce timers are advanced inside
+    // ONE act, so no render happens between the two dispatches — only the
+    // hook's per-slot in-flight latch can stop the second.
+    ;(api.planAction as ReturnType<typeof vi.fn>).mockImplementation(() => new Promise(() => {}))
+    await renderPane('pane-plan-5', { mode: 'orchestrator' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+    vi.useFakeTimers()
+    await act(async () => {
+      fireEvent.click(chip('Go'))
+      fireEvent.click(chip('Go All'))
+      vi.advanceTimersByTime(FOLLOWUP_CHIP_DEBOUNCE_MS + 10)
+    })
+    expect(api.planAction).toHaveBeenCalledTimes(1)
+    expect(api.planAction).toHaveBeenCalledWith('pane-plan-5', 'Go')
+  })
+
+  it('Cancel goes through while a Go is still in flight (the stop control is never swallowed)', async () => {
+    // The latch guards the stage-advancing actions only. A user who clicks Go
+    // and immediately realises the plan is wrong must be able to Cancel inside
+    // the request window — the server's cancel path is re-entrant, so letting
+    // it through is safe; dropping it would advance a stage they tried to stop.
+    ;(api.planAction as ReturnType<typeof vi.fn>).mockImplementation(() => new Promise(() => {}))
+    await renderPane('pane-plan-8', { mode: 'orchestrator' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    await act(async () => { clickOption('Cancel') })
+    expect(api.planAction).toHaveBeenCalledTimes(2)
+    expect(api.planAction).toHaveBeenLastCalledWith('pane-plan-8', 'Cancel')
+  })
+
+  it('the latch RELEASES once a dispatch settles — a later stage can be approved again', async () => {
+    // The half of single-flight whose regression is worst: drop the hook's
+    // onSettled cleanup and every never-resolving-mock test still passes,
+    // while in production the first Go latches the slot for the process
+    // lifetime and every later stage approval is a silent no-op.
+    // (clearAllMocks preserves implementations, so the never-resolving mock
+    // from the tests above would otherwise still be active here.)
+    ;(api.planAction as ReturnType<typeof vi.fn>).mockImplementation(() => Promise.resolve({ ok: true }))
+    await renderPane('pane-plan-9', { mode: 'orchestrator' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    // Let the mocked dispatch resolve so onSettled runs and frees the slot.
+    await act(async () => { await Promise.resolve() })
+    await act(async () => { clickOption('Go All') })
+    expect(api.planAction).toHaveBeenCalledTimes(2)
+    expect(api.planAction).toHaveBeenLastCalledWith('pane-plan-9', 'Go All')
+  })
+
+  it('a pane dispatches against its OWN slot, not another pane\'s (slot isolation)', async () => {
+    // Two live panes, plan chips in both; the dispatch from pane B must carry
+    // pane B's slot key — the regression most likely to slip through a copy
+    // of ChatPage's handler, which uses the page-global active slot.
+    ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockResolvedValue({ messages: PLAN_MESSAGES, running: false, has_more: false, total: PLAN_MESSAGES.length })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const store = configureStore({
+      reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
+      preloadedState: {
+        dashboard: {
+          status: null, connected: true,
+          slots: [
+            { key: 'pane-fg', messages: 0, running: false, mode: 'orchestrator', pending_approval: false, waiting_for_input: false, last_activity_ts: undefined },
+            { key: 'pane-bg', messages: 0, running: false, mode: 'orchestrator', pending_approval: false, waiting_for_input: false, last_activity_ts: undefined },
+          ],
+          unreadSlots: [], refreshTrigger: 0, approvalMode: 'normal',
+          subagentRunning: {}, subagentDetails: {}, subagentText: {},
+        } as unknown as RootState['dashboard'],
+      } as Partial<RootState>,
+    })
+    let container!: HTMLElement
+    await act(async () => {
+      ;({ container } = render(
+        <Provider store={store}>
+          <QueryClientProvider client={qc}>
+            <ThemeProvider>
+              <MemoryRouter>
+                <div>
+                  <ChatPane slotKey="pane-fg" />
+                  <ChatPane slotKey="pane-bg" />
+                </div>
+              </MemoryRouter>
+            </ThemeProvider>
+          </QueryClientProvider>
+        </Provider>,
+      ))
+    })
+    await waitFor(() => expect(screen.getAllByRole('button', { name: 'Go' })).toHaveLength(2))
+    const panes = container.querySelectorAll('[data-chat-pane]')
+    expect(panes).toHaveLength(2)
+    const bgChip = within(panes[1] as HTMLElement).getByRole('button', { name: 'Go' })
+    vi.useFakeTimers()
+    await act(async () => {
+      fireEvent.click(bgChip)
+      vi.advanceTimersByTime(FOLLOWUP_CHIP_DEBOUNCE_MS + 10)
+    })
+    expect(api.planAction).toHaveBeenCalledTimes(1)
+    expect(api.planAction).toHaveBeenCalledWith('pane-bg', 'Go')
   })
 })

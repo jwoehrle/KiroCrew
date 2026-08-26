@@ -325,6 +325,151 @@ async def test_list_apps_enriches_running_backend(
     }
 
 
+@pytest.mark.asyncio
+async def test_list_apps_overwrites_the_trust_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _setup_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        routes_mod,
+        "list_apps",
+        lambda: [
+            {
+                "name": APP,
+                "sourceUrl": "HTTPS://Clone.Example.test/Owner/App.git/",
+                "trustRepository": "https://evil.example/spoof",
+            }
+        ],
+    )
+    monkeypatch.setattr(routes_mod, "list_app_processes", lambda: [])
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get("/api/apps")
+        assert resp.status == 200
+        [entry] = await resp.json()
+
+    assert entry["trustRepository"] == "https://clone.example.test/Owner/App"
+
+
+@pytest.mark.asyncio
+async def test_list_apps_never_returns_embedded_clone_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _setup_env(tmp_path, monkeypatch)
+    secret = "SuperSecret"
+    monkeypatch.setattr(
+        routes_mod,
+        "list_apps",
+        lambda: [
+            {
+                "name": APP,
+                "sourceUrl": f"HTTPS://User:{secret}@Clone.Example.test/Owner/App.git/",
+                "manifest": {
+                    "name": APP,
+                    "repo": f"https://Manifest:{secret}@Clone.Example.test/Owner/App",
+                },
+            }
+        ],
+    )
+    monkeypatch.setattr(routes_mod, "list_app_processes", lambda: [])
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get("/api/apps")
+        assert resp.status == 200
+        raw = await resp.text()
+
+    assert secret not in raw
+    [entry] = json.loads(raw)
+    assert entry["sourceUrl"] == "HTTPS://Clone.Example.test/Owner/App.git/"
+    assert entry["manifest"]["repo"] == "https://Clone.Example.test/Owner/App"
+    assert entry["trustRepository"] == "https://clone.example.test/Owner/App"
+
+
+@pytest.mark.asyncio
+async def test_get_app_overwrites_the_trust_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _setup_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        routes_mod,
+        "get_app",
+        lambda name: {
+            "name": name,
+            "sourceUrl": "https://clone.example.test/Owner/App.git",
+            "trustRepository": "https://evil.example/spoof",
+        },
+    )
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get(f"/api/apps/{APP}")
+        assert resp.status == 200
+        entry = await resp.json()
+
+    assert entry["trustRepository"] == "https://clone.example.test/Owner/App"
+
+
+@pytest.mark.asyncio
+async def test_list_apps_resolves_legacy_registry_trust_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-provenance registry install must show the current clone target."""
+    _setup_env(tmp_path, monkeypatch)
+    clone_target = "https://clone.example.test/Owner/legacy-app"
+    monkeypatch.setattr(
+        routes_mod,
+        "list_apps",
+        lambda: [
+            {
+                "name": APP,
+                "source": f"registry:{APP}",
+                "trustRepository": "https://evil.example/spoof",
+            }
+        ],
+    )
+    monkeypatch.setattr(routes_mod, "list_app_processes", lambda: [])
+    monkeypatch.setattr(
+        "kiro_crew.apps.registry.get_registry_app",
+        lambda name: {"name": name, "gitUrl": f"{clone_target}.git"},
+    )
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get("/api/apps")
+        assert resp.status == 200
+        [entry] = await resp.json()
+
+    assert entry["trustRepository"] == clone_target
+
+
+@pytest.mark.asyncio
+async def test_get_app_keeps_genuinely_local_app_repositoryless(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-named registry row must not be attached to a local install."""
+    _setup_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        routes_mod,
+        "get_app",
+        lambda name: {
+            "name": name,
+            "source": str(tmp_path / "local-source"),
+            "origin": "local",
+            "trustRepository": "https://evil.example/spoof",
+        },
+    )
+
+    def _must_not_resolve(_name: str):
+        pytest.fail("a local install must not fall through to the registry")
+
+    monkeypatch.setattr("kiro_crew.apps.registry.get_registry_app", _must_not_resolve)
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get(f"/api/apps/{APP}")
+        assert resp.status == 200
+        entry = await resp.json()
+
+    assert "trustRepository" not in entry
+
+
 # ---------------------------------------------------------------------------
 # Migrated deploy-web compatibility redirects
 # ---------------------------------------------------------------------------
@@ -531,6 +676,53 @@ class TestRegisterExternal:
             data = await resp.json()
         assert data["ok"] is True
         assert data["secret"]
+
+    @pytest.mark.asyncio
+    async def test_registration_never_persists_or_returns_source_credentials(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.apps.manager import INSTALLED_META_FILENAME, app_dir
+
+        _setup_env(tmp_path, monkeypatch)
+        credential = "register-source-secret"
+        source = (
+            f"https://register-user:{credential}@clone.example.test/owner/ext-app.git"
+        )
+        safe_source = "https://clone.example.test/owner/ext-app.git"
+
+        async with TestClient(TestServer(_make_app())) as client:
+            registered = await client.post(
+                "/api/apps/register",
+                json={
+                    "name": "ext-app",
+                    "version": "1.0.0",
+                    "displayName": "External App",
+                    "source": source,
+                    "lifecycle": "app",
+                    "resources": "app",
+                },
+            )
+            assert registered.status == 201
+            assert credential not in await registered.text()
+
+            persisted = (
+                app_dir("ext-app") / INSTALLED_META_FILENAME
+            ).read_text(encoding="utf-8")
+            assert credential not in persisted
+            assert json.loads(persisted)["source"] == safe_source
+
+            detail = await client.get("/api/apps/ext-app")
+            listing = await client.get("/api/apps")
+            assert detail.status == 200
+            assert listing.status == 200
+            detail_text = await detail.text()
+            listing_text = await listing.text()
+
+        assert credential not in detail_text
+        assert credential not in listing_text
+        assert json.loads(detail_text)["source"] == safe_source
+        [listed] = json.loads(listing_text)
+        assert listed["source"] == safe_source
 
     @pytest.mark.asyncio
     async def test_rejected_name_is_400(
@@ -752,6 +944,70 @@ class TestUpdateApp:
             data = await resp.json()
         assert data["ok"] is True
         assert "registration" in data
+
+    @pytest.mark.asyncio
+    async def test_app_token_cannot_replace_repository_bound_code_from_local_source(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The app-owned update API cannot turn repo A's grant into repo B code."""
+        home = _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+
+        from kiro_crew.apps.manager import get_app, set_app_provenance
+        from kiro_crew.config.loader import _invalidate_config_cache
+        from kiro_crew.dashboard.token_auth import generate_token, token_auth_middleware
+
+        reviewed = "https://clone.example.test/Owner/reviewed-app"
+        assert set_app_provenance(
+            APP,
+            source=f"registry:{APP}",
+            url=reviewed,
+        )
+        (home / "config.json").write_text(
+            json.dumps(
+                {
+                    "agent": {
+                        "apps_allow_third_party": False,
+                        "apps_trusted": [APP],
+                        "apps_trusted_repositories": {APP: reviewed},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        _invalidate_config_cache()
+        enabled = enable_app(APP)
+        assert enabled.ok, enabled.error
+
+        attacker_source = _make_app_source(
+            tmp_path / "attacker", version="9.9.9", displayName="Rebound Code"
+        )
+        (attacker_source / "attacker.py").write_text(
+            "raise RuntimeError('repository binding bypassed')\n", encoding="utf-8"
+        )
+
+        # This is a real app-claim token, not a handler-only identity stub. The
+        # auth middleware deliberately permits an app token on its own
+        # /api/apps/<name>/ namespace, so the lifecycle handler must enforce the
+        # repository boundary itself.
+        token = generate_token(APP, ttl_seconds=300, app=APP)
+        app = web.Application(middlewares=[token_auth_middleware()])
+        register_app_routes(app)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                f"/api/apps/{APP}/update",
+                params={"token": token},
+                json={"source": str(attacker_source)},
+            )
+            assert resp.status == 400
+            body = await resp.json()
+
+        assert body["code"] == "app_trust_repository_mismatch"
+        installed = get_app(APP)
+        assert installed is not None
+        assert installed["version"] == "1.0.0"
+        assert installed["sourceUrl"] == reviewed
+        assert not (home / "apps" / APP / "attacker.py").exists()
 
 
 # ---------------------------------------------------------------------------

@@ -26,6 +26,7 @@ from kiro_crew.apps.admission import app_admission_denied
 from kiro_crew.apps.discovery import discover_builtin_apps
 from kiro_crew.apps.execution import (
     app_execution_denied,
+    repository_bound_grant_denied,
     shipped_builtin_app_root,
 )
 from kiro_crew.apps.manifest import AppManifest, app_name_error
@@ -231,10 +232,29 @@ def _read_installed(name: str) -> InstalledApp | None:
 
 
 def _write_installed(name: str, meta: InstalledApp) -> None:
-    """Write installed.json for an app."""
+    """Write credential-free installed.json metadata for an app.
+
+    A raw clone/source URL is a transport capability, not durable app identity.
+    Registry callers already pass credential-free provenance, but the external
+    registration API also accepts a free-form ``source`` and direct Python
+    callers can supply ``sourceUrl`` independently.  Sanitize all three
+    coordinate-shaped fields at the persistence boundary so no producer can
+    put embedded userinfo into long-lived metadata.  Local paths are preserved
+    by the shared parser.
+
+    The import is deferred because ``apps.registry`` imports this module.
+    """
+    from kiro_crew.apps.registry import _strip_git_target_userinfo
+
+    credential_free_meta = replace(
+        meta,
+        source=_strip_git_target_userinfo(str(meta.source or "")),
+        sourceUrl=_strip_git_target_userinfo(str(meta.sourceUrl or "")),
+        sourceRegistry=_strip_git_target_userinfo(str(meta.sourceRegistry or "")),
+    )
     meta_path = app_dir(name) / INSTALLED_META_FILENAME
     meta_path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write(meta_path, json.dumps(meta.to_dict(), indent=2) + "\n")
+    atomic_write(meta_path, json.dumps(credential_free_meta.to_dict(), indent=2) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +460,10 @@ def app_lifecycle_lock(name: str) -> LoopBoundLock:
 
 
 def install_app(
-    source: str | Path, *, expected_name: str | None = None
+    source: str | Path,
+    *,
+    expected_name: str | None = None,
+    source_repository: str = "",
 ) -> AppResult:
     """Install an app from a local directory path.
 
@@ -534,6 +557,24 @@ def install_app(
             name=name,
             error=f"app {name!r} is already installed (v{existing.version}). "
             f"Uninstall first or use the update endpoint.",
+        )
+
+    trust_denied = repository_bound_grant_denied(
+        name, repository=source_repository
+    )
+    if trust_denied:
+        sel().log_api_access(
+            caller="app_install",
+            operation="trust_repository",
+            outcome="rejected",
+            resources=f"name={name!r}",
+            error=trust_denied,
+        )
+        return AppResult(
+            ok=False,
+            name=name,
+            error=trust_denied,
+            error_code="app_trust_repository_mismatch",
         )
 
     # Preserve existing data/ directory (left behind by a prior default uninstall)
@@ -653,7 +694,12 @@ def install_app(
 # ---------------------------------------------------------------------------
 
 
-def update_app(source: str | Path, *, expected_name: str | None = None) -> AppResult:
+def update_app(
+    source: str | Path,
+    *,
+    expected_name: str | None = None,
+    source_repository: str = "",
+) -> AppResult:
     """Update an already-installed app from a local directory path.
 
     1. Validate new manifest
@@ -704,6 +750,24 @@ def update_app(source: str | Path, *, expected_name: str | None = None) -> AppRe
     if not existing:
         return AppResult(ok=False, name=name, error=f"app {name!r} is not installed")
 
+    trust_denied = repository_bound_grant_denied(
+        name, repository=source_repository
+    )
+    if trust_denied:
+        sel().log_api_access(
+            caller="app_update",
+            operation="trust_repository",
+            outcome="rejected",
+            resources=f"name={name!r}",
+            error=trust_denied,
+        )
+        return AppResult(
+            ok=False,
+            name=name,
+            error=trust_denied,
+            error_code="app_trust_repository_mismatch",
+        )
+
     old_version = existing.version
 
     # Preserve data directory and app secret
@@ -753,7 +817,8 @@ def update_app(source: str | Path, *, expected_name: str | None = None) -> AppRe
 
     # Update metadata — carry every persisted field forward from ``existing``
     # via dataclasses.replace, overriding only what the update actually changes
-    # (version/displayName/updatedAt/source). Constructing a fresh InstalledApp
+    # (version/displayName/updatedAt/source and source provenance). Constructing
+    # a fresh InstalledApp
     # here silently dropped any field not re-listed (enabled, installedAt,
     # origin, resources, lifecycle, schemaVersion, migratedTo, and — the bug
     # that surfaced this — the ``dev`` flag, so updating an app being iterated
@@ -765,6 +830,15 @@ def update_app(source: str | Path, *, expected_name: str | None = None) -> AppRe
         displayName=manifest.displayName,
         updatedAt=_now_iso(),
         source=str(source),
+        # A local-source update is a provenance transition, not a refresh of the
+        # old registry checkout. Keeping the previous sourceUrl made runtime
+        # repository checks attest repo A while the files now came from local B.
+        # Registry callers pass the target they just cloned and then persist the
+        # remaining commit/signer fields through set_app_provenance.
+        sourceUrl=source_repository.strip(),
+        sourceRegistry="",
+        sourceCommit="",
+        sourceSigner="",
     )
     _write_installed(name, meta)
 
@@ -833,6 +907,7 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
         # grant the app never held would be granting, not restoring.
         had_grant = _has_trust_grant(name)
         granted_repository = _trust_grant_repository(name)
+        granted_local = _trust_grant_local(name)
         _drop_trust_grant(name)
     except Exception as exc:  # noqa: BLE001 - refuse rather than half-uninstall
         logger.warning("trust-grant cleanup on uninstall of %r failed", name, exc_info=True)
@@ -879,7 +954,12 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
         # failed uninstall with no side effect on trust.
         restore_note = ""
         try:
-            _restore_trust_grant(name, had_grant, granted_repository)
+            _restore_trust_grant(
+                name,
+                had_grant,
+                granted_repository,
+                local=granted_local,
+            )
         except Exception as restore_exc:  # noqa: BLE001 - report, never mask the real error
             logger.warning(
                 "could not restore %r's execution grant after a failed uninstall",
@@ -1046,16 +1126,25 @@ def _drop_trust_grant(name: str) -> None:
     if not isinstance(agent_raw, dict):
         return
     base_grants = agent_raw.get("apps_trusted")
-    # A non-list value cannot express a grant for this app, so there is nothing
-    # here that would later admit a replacement under this name.
-    if not isinstance(base_grants, list) or name not in base_grants:
-        return
-    agent_raw["apps_trusted"] = [a for a in base_grants if a != name]
     repositories = agent_raw.get("apps_trusted_repositories")
+    local_grants = agent_raw.get("apps_trusted_local")
+    has_name = isinstance(base_grants, list) and name in base_grants
+    has_repository = isinstance(repositories, dict) and name in repositories
+    has_local = isinstance(local_grants, list) and name in local_grants
+    # Orphaned kind metadata is inert without the name grant, but uninstall still
+    # clears it so a later hand edit cannot unexpectedly reactivate old consent.
+    # Preserve the no-grant fast path: ordinary uninstalls perform no config write.
+    if not (has_name or has_repository or has_local):
+        return
+    agent_raw["apps_trusted"] = [
+        a for a in (base_grants if isinstance(base_grants, list) else []) if a != name
+    ]
     if isinstance(repositories, dict):
         repositories = dict(repositories)
         repositories.pop(name, None)
         agent_raw["apps_trusted_repositories"] = repositories
+    if isinstance(local_grants, list):
+        agent_raw["apps_trusted_local"] = [a for a in local_grants if a != name]
     # Concurrency: this is the repo's standard config read-modify-write, and it
     # inherits that model exactly — no cross-process lock, atomic (tmp+rename) on
     # the way out so no reader can see a torn file. `read_config_for_update`'s own
@@ -1137,7 +1226,29 @@ def _trust_grant_repository(name: str) -> str:
     return repository if isinstance(repository, str) else ""
 
 
-def _restore_trust_grant(name: str, had_grant: bool, repository: str = "") -> None:
+def _trust_grant_local(name: str) -> bool:
+    """Whether *name* has an explicit local grant marker in the BASE config."""
+    path = config_path()
+    if not path.is_file():
+        return False
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    agent_raw = raw.get("agent") if isinstance(raw, dict) else None
+    if not isinstance(agent_raw, dict):
+        return False
+    local_grants = agent_raw.get("apps_trusted_local")
+    return isinstance(local_grants, list) and name in local_grants
+
+
+def _restore_trust_grant(
+    name: str,
+    had_grant: bool,
+    repository: str = "",
+    *,
+    local: bool = False,
+) -> None:
     """Put *name*'s grant back after an uninstall failed with the app still installed.
 
     A no-op when the app held no grant to begin with — restoring one it never had
@@ -1161,6 +1272,12 @@ def _restore_trust_grant(name: str, had_grant: bool, repository: str = "") -> No
         bindings = dict(repositories) if isinstance(repositories, dict) else {}
         bindings[name] = repository
         agent_raw["apps_trusted_repositories"] = bindings
+    if local:
+        local_grants = agent_raw.get("apps_trusted_local")
+        local_names = list(local_grants) if isinstance(local_grants, list) else []
+        if name not in local_names:
+            local_names.append(name)
+        agent_raw["apps_trusted_local"] = local_names
     write_config_atomically(path, raw)
     logger.info("Restored %s's trust grant after a failed uninstall", name)
     try:
@@ -1488,6 +1605,7 @@ def register_external_app(
     origin: str = "external",
     resources: str = "app",
     lifecycle: str = "app",
+    source_repository: str = "",
 ) -> AppResult:
     """Register a self-managed app with KiroCrew's app system.
 
@@ -1560,6 +1678,24 @@ def register_external_app(
         )
         return AppResult(ok=False, name=name, error=f"blocked by admission policy: {denied}")
 
+    trust_denied = repository_bound_grant_denied(
+        name, repository=source_repository
+    )
+    if trust_denied:
+        sel().log_api_access(
+            caller="app_register_external",
+            operation="trust_repository",
+            outcome="rejected",
+            resources=f"name={name!r}",
+            error=trust_denied,
+        )
+        return AppResult(
+            ok=False,
+            name=name,
+            error=trust_denied,
+            error_code="app_trust_repository_mismatch",
+        )
+
     dest = app_dir(name)
     existing = _read_installed(name)
 
@@ -1595,6 +1731,10 @@ def register_external_app(
         existing.updatedAt = _now_iso()
         if source:
             existing.source = source
+        existing.sourceUrl = source_repository.strip()
+        existing.sourceRegistry = ""
+        existing.sourceCommit = ""
+        existing.sourceSigner = ""
         existing.origin = origin
         existing.resources = resources
         existing.lifecycle = lifecycle
@@ -1609,6 +1749,7 @@ def register_external_app(
             enabled=True,  # self-managed apps are always "enabled"
             installedAt=_now_iso(),
             source=source,
+            sourceUrl=source_repository.strip(),
             origin=origin,
             resources=resources,
             lifecycle=lifecycle,

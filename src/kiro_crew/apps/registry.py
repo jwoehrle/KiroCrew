@@ -44,7 +44,11 @@ from typing import Any
 
 from kiro_crew.apps import install_receipt, official_catalog
 from kiro_crew.apps.admission import app_admission_denied, verified_signer
-from kiro_crew.apps.execution import app_execution_denied, trusted_app_repository
+from kiro_crew.apps.execution import (
+    app_execution_denied,
+    repository_bound_grant_denied,
+    trusted_app_repository,
+)
 from kiro_crew.apps.manager import (
     get_app,
     install_app,
@@ -631,7 +635,7 @@ def _registry_trust_tier(registry_name: str) -> str:
                 if tier != _TRUST_INDEX:
                     logger.warning(
                         "Registry %r declares unknown trust %r — reading it as %r",
-                        registry_name,
+                        _strip_git_target_userinfo(registry_name),
                         tier,
                         _TRUST_INDEX,
                     )
@@ -639,7 +643,11 @@ def _registry_trust_tier(registry_name: str) -> str:
     except PlatformCompositionError:
         raise
     except Exception:
-        logger.debug("trust-tier lookup failed for %r", registry_name, exc_info=True)
+        logger.debug(
+            "trust-tier lookup failed for %r",
+            _strip_git_target_userinfo(registry_name),
+            exc_info=True,
+        )
     return _TRUST_INDEX
 
 
@@ -849,7 +857,7 @@ async def _owner_tier_confirmed(entry: dict[str, Any]) -> bool:
     except Exception:
         logger.warning(
             "owner-tier confirmation failed for %r; keeping the credential-free posture",
-            registry_name,
+            _strip_git_target_userinfo(registry_name),
             exc_info=True,
         )
         _sel_credential_decision(
@@ -862,7 +870,7 @@ async def _owner_tier_confirmed(entry: dict[str, Any]) -> bool:
     if not fresh:
         logger.info(
             "owner-tier registry %r could not be re-read; keeping the credential-free posture",
-            registry_name,
+            _strip_git_target_userinfo(registry_name),
         )
         _sel_credential_decision(
             "install_from_registry_owner_tier",
@@ -885,7 +893,7 @@ async def _owner_tier_confirmed(entry: dict[str, Any]) -> bool:
     logger.warning(
         "owner-tier registry %r does not currently list app %r at %s (branch %r, subdir %r) — "
         "refusing the credential escalation",
-        registry_name,
+        _strip_git_target_userinfo(registry_name),
         wanted[0],
         _redact_url_userinfo(wanted[1]),
         wanted[2],
@@ -1240,8 +1248,9 @@ async def _fetch_app_manifest(
     and a pinned row carries no branch at all, so the branch would silently be
     the ``"main"`` default.
     """
-    if not git_url:
-        git_url = repo
+    credential_target = git_url or repo
+    git_url = _strip_git_target_userinfo(credential_target)
+    credentialed_transport = credential_target != git_url
 
     # Try persistent clone first (already installed).
     #
@@ -1294,7 +1303,7 @@ async def _fetch_app_manifest(
     if not await asyncio.to_thread(is_clone_host_trusted, git_url):
         logger.debug(
             "manifest clone refused for %r: host not in trusted forge/registry set (SSRF gate)",
-            git_url,
+            _strip_git_target_userinfo(git_url),
         )
         return None
 
@@ -1335,11 +1344,16 @@ async def _fetch_app_manifest(
                 commit,
                 fetch_dest,
                 fetch_log,
+                credential_target=credential_target,
                 clone_env=clone_env,
                 sandbox_mode=sandbox_mode,
             )
             if err is not None:
-                logger.debug("manifest fetch of pinned commit failed for %s: %s", git_url, err)
+                logger.debug(
+                    "manifest fetch of pinned commit failed for %s: %s",
+                    _strip_git_target_userinfo(git_url),
+                    str(err),
+                )
                 return None
         else:
             clone_cmd = [
@@ -1355,11 +1369,12 @@ async def _fetch_app_manifest(
             ]
             sandboxed_cmd, _cleanup = wrap_argv(clone_cmd, mode=sandbox_mode)
             sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
+            transport_env = _git_transport_env(credential_target, git_url, clone_env)
             proc = await create_subprocess_limited(
                 *sandboxed_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=clone_env,
+                env=transport_env,
                 start_new_session=platform_compat.IS_POSIX,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )
@@ -1367,8 +1382,11 @@ async def _fetch_app_manifest(
             if proc.returncode != 0:
                 logger.debug(
                     "manifest clone failed for %s: %s",
-                    git_url,
-                    stderr.decode(errors="replace").strip(),
+                    _strip_git_target_userinfo(git_url),
+                    _loggable_git_transport_output(
+                        stderr.decode(errors="replace").strip(),
+                        credentialed=credentialed_transport,
+                    ),
                 )
                 return None
             checkout_root = Path(tmp_root)
@@ -1386,7 +1404,11 @@ async def _fetch_app_manifest(
         content = await asyncio.to_thread(manifest_path.read_text, "utf-8")
         return json.loads(content)
     except (asyncio.TimeoutError, OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-        logger.debug("Failed to fetch app.json from %s: %s", git_url, exc)
+        logger.debug(
+            "Failed to fetch app.json from %s: %s",
+            _strip_git_target_userinfo(git_url),
+            _loggable_git_transport_output(str(exc), credentialed=credentialed_transport),
+        )
         return None
     finally:
         if tmp_root:
@@ -1619,6 +1641,135 @@ async def _move_checkout_aside(dest: Path, log_lines: list[str]) -> Path | None:
     return aside
 
 
+def _strip_git_target_userinfo(url: str) -> str:
+    """Return *url* without credential-bearing URI/scp userinfo.
+
+    Clone credentials select *who may fetch* a repository; they are not part of
+    the repository's identity. Keeping them in the consent identity both made
+    credential rotation invalidate an otherwise identical grant and, worse,
+    carried secrets through ``trustRepository`` into config and the dashboard.
+
+    URI authorities are unambiguous, so everything through the last ``@`` is
+    removed there. For the common scp form (``user@host:path``) only the
+    syntactically distinct user prefix is removed. Bare/local paths are left
+    untouched rather than guessing that an ``@`` in a filename is authority.
+    """
+
+    target = (url or "").strip()
+    scheme, sep, rest = target.partition("://")
+    if sep:
+        suffix_at = len(rest)
+        for delimiter in "/?#":
+            found = rest.find(delimiter)
+            if found >= 0:
+                suffix_at = min(suffix_at, found)
+        authority, suffix = rest[:suffix_at], rest[suffix_at:]
+        _, at, hostport = authority.rpartition("@")
+        return f"{scheme}://{hostport if at else authority}{suffix}"
+
+    # Parse scp syntax with a deterministic scan rather than a backtracking
+    # regular expression.  Clone targets are registry-controlled and can be
+    # arbitrarily long; a nested quantified regex here made consent-listing work
+    # grow polynomially on a deliberately unterminated bracketed authority.
+    #
+    # The accepted shape stays the same: ``user@host:path`` or
+    # ``user@[ipv6]:path``; the user and an unbracketed host must be non-empty and
+    # contain no slash/whitespace/extra ``@``.  Bare/local paths (including ones
+    # that merely contain an ``@``) are returned unchanged.
+    at_index = target.find("@")
+    if at_index <= 0:
+        return target
+    user = target[:at_index]
+    if any(ch == "/" or ch == "@" or ch.isspace() for ch in user):
+        return target
+
+    authority_and_path = target[at_index + 1 :]
+    if authority_and_path.startswith("["):
+        close = authority_and_path.find("]", 1)
+        if close <= 1 or close + 1 >= len(authority_and_path):
+            return target
+        if authority_and_path[close + 1] != ":":
+            return target
+        path = authority_and_path[close + 2 :]
+    else:
+        colon = authority_and_path.find(":")
+        if colon <= 0:
+            return target
+        host = authority_and_path[:colon]
+        if any(ch in "/:@" or ch.isspace() for ch in host):
+            return target
+        path = authority_and_path[colon + 1 :]
+
+    # Match the former regex's full-string behaviour: ``.`` did not consume a
+    # newline in the path suffix, so such malformed input was left untouched.
+    if "\n" in path:
+        return target
+    return authority_and_path
+
+
+def _loggable_git_transport_output(text: str, *, credentialed: bool) -> str:
+    """Return git output that is safe to publish or log.
+
+    A credential-bearing URL is expanded inside git from the one-shot transport
+    environment, and git is allowed to echo that expanded URL on failure. In that
+    posture we never try to scrub and forward free text: doing so would keep the
+    raw credential in the logging dataflow and make correctness depend on an
+    exhaustive replacement grammar. Return only fixed classifications instead.
+
+    Non-credentialed transports retain the historical output because there is no
+    embedded userinfo capability for git to echo.
+    """
+
+    if not credentialed or not text:
+        return text
+    if _git_output_is_auth_shaped(text):
+        return "git authentication failed (credentialed transport details redacted)"
+    failure_class = _redacted_git_failure_class(text)
+    if failure_class:
+        return f"git transport failed: {failure_class} (details redacted)"
+    return "git transport output redacted (credentialed remote)"
+
+
+def _git_transport_env(
+    credential_target: str, safe_target: str, env: dict[str, str]
+) -> dict[str, str]:
+    """Return the one-shot environment for an already-sanitized git command.
+
+    Embedded HTTP/SSH userinfo may be needed for the network request, but handing
+    that URL directly to ``git clone`` also persists it as ``remote.origin.url``.
+    Callers therefore build and sandbox argv with *safe_target* only. This helper
+    receives the credential-bearing transport target separately and returns only
+    an environment -- never an argv element or repository identity.
+
+    The mapping is passed through ``GIT_CONFIG_*`` instead of ``git -c`` argv.
+    Besides keeping process listings credential-free, this is a security boundary:
+    sandbox diagnostics retain and log argv, so raw userinfo must never enter that
+    generic API. The returned environment is a copy so callers can create it only
+    after :func:`wrap_argv` and give it to the exact clone/fetch/pull subprocess;
+    local setup and checkout commands keep the credential-free base environment.
+    """
+
+    if _strip_git_target_userinfo(credential_target) != safe_target:
+        raise ValueError("git credential target does not match the safe clone target")
+    if not credential_target or credential_target == safe_target:
+        return env
+
+    transport_env = dict(env)
+    try:
+        config_count = int(transport_env.get("GIT_CONFIG_COUNT", "0"))
+    except ValueError:
+        # ``git`` would reject a malformed count too. Resetting the command-local
+        # sequence is the useful fail-safe here: the caller's input mapping is not
+        # mutated, and no inherited entry can displace the credential rewrite.
+        config_count = 0
+    if config_count < 0:
+        config_count = 0
+    transport_env[f"GIT_CONFIG_KEY_{config_count}"] = f"url.{credential_target}.insteadOf"
+    transport_env[f"GIT_CONFIG_VALUE_{config_count}"] = safe_target
+    transport_env["GIT_CONFIG_COUNT"] = str(config_count + 1)
+    return transport_env
+
+
 def _normalize_git_target(url: str) -> str:
     """Canonical form used whenever a security decision compares clone URLs.
 
@@ -1633,7 +1784,7 @@ def _normalize_git_target(url: str) -> str:
     that requiring URL equality exists to prevent.
     """
 
-    normalized = (url or "").strip().rstrip("/")
+    normalized = _strip_git_target_userinfo(url).rstrip("/")
     if normalized.endswith(".git"):
         normalized = normalized[: -len(".git")]
     scheme, sep, rest = normalized.partition("://")
@@ -1641,8 +1792,38 @@ def _normalize_git_target(url: str) -> str:
         # No scheme to split on (scp-style or a bare path): fold nothing, since
         # the host cannot be told from the path without guessing.
         return normalized
-    host, slash, path = rest.partition("/")
-    return f"{scheme.lower()}://{host.lower()}{slash}{path}"
+
+    # Split the authority without parsing/re-serialising the rest of the URL.
+    # ``urlsplit`` exposes convenient hostname/port properties, but rebuilding
+    # from decoded components changes exact spelling. Only the URI scheme and
+    # HOSTNAME are case-insensitive. The port, path, query, and fragment remain
+    # byte-for-byte; userinfo was removed above because credentials are fetch
+    # capability, not repository identity or consent-display material.
+    suffix_at = len(rest)
+    for delimiter in "/?#":
+        found = rest.find(delimiter)
+        if found >= 0:
+            suffix_at = min(suffix_at, found)
+    authority, suffix = rest[:suffix_at], rest[suffix_at:]
+
+    hostport = authority
+    if hostport.startswith("["):
+        # RFC URI IPv6 literals are bracketed. Preserve brackets and the exact
+        # non-default port spelling while folding only the literal hostname.
+        close = hostport.find("]")
+        if close >= 0:
+            hostport = f"[{hostport[1:close].lower()}]{hostport[close + 1:]}"
+    elif hostport.count(":") <= 1:
+        # Zero/one colon is an ordinary hostname with an optional port. More
+        # than one is malformed/unbracketed IPv6; do not guess where its host
+        # ends because a false equivalence here rebinds an execution grant.
+        hostname, colon, port = hostport.rpartition(":")
+        if colon:
+            hostport = f"{hostname.lower()}:{port}"
+        else:
+            hostport = hostport.lower()
+
+    return f"{scheme.lower()}://{hostport}{suffix}"
 
 
 def _same_git_target(a: str, b: str) -> bool:
@@ -1792,8 +1973,11 @@ def _merge_manifest(entry: dict[str, Any], manifest: dict[str, Any]) -> dict[str
     Everything else comes from app.json, with the blob proxy URL pattern
     applied to image paths.
     """
-    repo = entry.get("repo", "")
+    raw_repo = entry.get("repo", "")
+    repo = _strip_git_target_userinfo(raw_repo) if isinstance(raw_repo, str) else ""
     result = {k: v for k, v in entry.items() if k in _REGISTRY_ROW_KEYS}
+    if isinstance(result.get("repo"), str):
+        result["repo"] = _strip_git_target_userinfo(result["repo"])
 
     # Top-level display fields from app.json
     for key in (
@@ -1979,10 +2163,14 @@ def _fold_author(value: object) -> str:
     return " ".join(folded.split()).lower()
 
 
-def _apply_trust_fields(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Stamp server-computed ``provenance`` and ``verified`` on every row.
+def _apply_trust_fields(
+    entries: list[dict[str, Any]],
+    *,
+    trust_repositories: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Stamp server-computed trust fields on every row.
 
-    SECURITY CONTRACT: these two fields are the API trust boundary for
+    SECURITY CONTRACT: these fields are the API trust boundary for
     ``GET /api/apps/registry``. They are computed here — where the
     server-attached ``_registry`` tag is authoritative — and OVERWRITE any
     value an index entry may have published, so an external registry can
@@ -2031,8 +2219,36 @@ def _apply_trust_fields(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
       ``"external"`` is dropped, so the wire never carries an ``origin`` that
       contradicts ``provenance: "external"`` — neither an index-published one
       nor one cross-stamped from an installed same-named app.
+    - ``trustRepository``: the normalized clone target the server resolved for
+      the app. It is OVERWRITTEN here, never copied from index or manifest
+      content, because the consent modal sends it back as proof of what the
+      operator reviewed. ``trust_repositories`` lets the catalog storefront
+      supply coordinates resolved separately from its display-only rows.
     """
     for entry in entries:
+        entry.pop("trustRepository", None)
+        name = entry.get("name")
+        if trust_repositories is None:
+            trust_repository = _normalize_git_target(_entry_git_url(entry))
+        elif isinstance(name, str):
+            trust_repository = _normalize_git_target(trust_repositories.get(name, ""))
+        else:
+            trust_repository = ""
+        if trust_repository:
+            entry["trustRepository"] = trust_repository
+
+        # These coordinates are display/provenance fields on the storefront
+        # response. Installation resolves its own authoritative row again; the
+        # browser neither needs nor may receive embedded clone credentials.
+        for coordinate_key in ("gitUrl", "repo", "sourceUrl"):
+            coordinate = entry.get(coordinate_key)
+            if isinstance(coordinate, str):
+                entry[coordinate_key] = _strip_git_target_userinfo(coordinate)
+
+        registry_name = entry.get("_registry")
+        if isinstance(registry_name, str):
+            entry["_registry"] = _strip_git_target_userinfo(registry_name)
+
         index_author = entry.pop("_index_author", None)
         folded_author = _fold_author(index_author)
         if entry.get("_registry"):
@@ -2071,6 +2287,47 @@ def _apply_trust_fields(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             else:
                 entry["verified"] = builtin or folded_author in FIRST_PARTY_AUTHORS
     return entries
+
+
+def _trust_repository_bindings(
+    entries: list[dict[str, Any]],
+    installed_map: dict[str, dict[str, Any]],
+    resolved: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Authoritative consent target for each storefront row.
+
+    An installed app is bound to the source URL recorded at install time; that
+    is also what the grant handler resolves first. A not-yet-installed catalog
+    row may have display and install coordinates from separate documents, so its
+    caller supplies the freshly resolved target in *resolved*. Every remaining
+    row (seed and external registries) resolves through ``_entry_git_url`` so a
+    legitimate ``gitUrl``/``repo`` difference follows the same precedence as
+    clone/install rather than treating the display alias as authority.
+    """
+    bindings: dict[str, str] = {}
+    resolved = resolved or {}
+    for entry in entries:
+        name = entry.get("name")
+        if not isinstance(name, str):
+            continue
+        installed = installed_map.get(name)
+        if installed is not None:
+            # The listing row was resolved from the same authoritative source
+            # as install. Supply it to the shared legacy fallback so storefront
+            # proof and the grant handler cannot disagree, without performing a
+            # second blocking catalog lookup on the event loop.
+            coordinate = resolved.get(name)
+            authoritative_entry = (
+                {"gitUrl": coordinate} if coordinate is not None else entry
+            )
+            _, bindings[name] = resolve_installed_trust_repository(
+                installed, registry_entry=authoritative_entry
+            )
+        elif name in resolved:
+            bindings[name] = resolved[name]
+        else:
+            bindings[name] = _entry_git_url(entry)
+    return bindings
 
 
 def _version_newer(registry_ver: str, installed_ver: str) -> bool:
@@ -2256,13 +2513,18 @@ async def _fetch_external_registry_index(
     """
     # Input validation — reject values that could be used for command injection.
     if not _looks_like_git_url(repo):
-        logger.warning("Rejecting non-cloneable external registry repo: %r", repo)
+        logger.warning(
+            "Rejecting non-cloneable external registry repo: %r",
+            _strip_git_target_userinfo(repo),
+        )
         return None
     if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_\-./]*$", branch) or ".." in branch:
         logger.warning("Rejecting invalid branch name: %r", branch)
         return None
 
-    git_url = repo
+    credential_target = repo
+    git_url = _strip_git_target_userinfo(credential_target)
+    credentialed_transport = credential_target != git_url
 
     # SEL audit: log external subprocess invocation for traceability (best-effort).
     def _sel_outcome(outcome: str) -> None:
@@ -2273,7 +2535,7 @@ async def _fetch_external_registry_index(
                 caller="registry",
                 operation="fetch_external_registry",
                 outcome=outcome,
-                resources=f"repo={repo} branch={branch}",
+                resources=(f"repo={_strip_git_target_userinfo(repo)} branch={branch}"),
             )
         except Exception as exc:
             logger.debug("SEL audit log failed for fetch_external_registry: %s", exc)
@@ -2298,11 +2560,12 @@ async def _fetch_external_registry_index(
         ]
         sandboxed_cmd, _ = wrap_argv(clone_cmd, mode=_context_clone_sandbox_mode(git_url))
         sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
+        clone_env = _git_transport_env(credential_target, git_url, minimal_env())
         proc = await create_subprocess_limited(
             *sandboxed_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=minimal_env(),
+            env=clone_env,
             start_new_session=platform_compat.IS_POSIX,
             creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
         )
@@ -2351,7 +2614,11 @@ async def _fetch_external_registry_index(
         return result
 
     except (asyncio.TimeoutError, OSError) as exc:
-        logger.debug("Failed to fetch external registry from %s: %s", git_url, exc)
+        logger.debug(
+            "Failed to fetch external registry from %s: %s",
+            _strip_git_target_userinfo(git_url),
+            _loggable_git_transport_output(str(exc), credentialed=credentialed_transport),
+        )
         _sel_outcome("failed")
         return None
     finally:
@@ -2389,12 +2656,12 @@ def _apply_configured_branch(entries: list[dict[str, Any]], reg, *, warn: bool =
     """
     for entry in entries:
         declared_branch = entry.get("branch")
-        if _entry_git_url(entry) == reg.repo:
+        if _same_git_target(_entry_git_url(entry), reg.repo):
             if warn and declared_branch is not None and declared_branch != reg.branch:
                 logger.warning(
                     "External registry %s entry %r declares branch %r; using the "
                     "configured registry branch %r",
-                    reg.name or reg.repo,
+                    reg.name or _strip_git_target_userinfo(reg.repo),
                     entry.get("name"),
                     declared_branch,
                     reg.branch,
@@ -2515,18 +2782,28 @@ async def _load_external_registries() -> list[dict[str, Any]]:
                 entry["_registry"] = name
             _apply_configured_branch(stale, reg)
             return stale
-        logger.warning("Failed to load external registry %s from %s", name, reg.repo)
+        logger.warning(
+            "Failed to load external registry %s from %s",
+            _strip_git_target_userinfo(name),
+            _strip_git_target_userinfo(reg.repo),
+        )
         return []
 
     results = await asyncio.gather(
         *[_load_one(reg) for reg in registries],
         return_exceptions=True,
     )
-    for result in results:
+    for reg, result in zip(registries, results, strict=True):
         if isinstance(result, list):
             all_entries.extend(result)
         elif isinstance(result, Exception):
-            logger.warning("External registry load failed: %s", result)
+            logger.warning(
+                "External registry load failed: %s",
+                _loggable_git_transport_output(
+                    str(result),
+                    credentialed=_strip_git_target_userinfo(reg.repo) != reg.repo,
+                ),
+            )
 
     return all_entries
 
@@ -2577,7 +2854,7 @@ async def refresh_registries(repo: str | None = None) -> dict[str, Any]:
     """
     registries = await asyncio.to_thread(_effective_registries)
     if repo:
-        registries = [r for r in registries if r.repo == repo]
+        registries = [r for r in registries if _same_git_target(r.repo, repo)]
         # A caller-supplied ``repo`` that matches no configured registry is a
         # client error, not a silent success: refreshing nothing and returning
         # ``ok: true`` would let an API client believe a sync happened when the
@@ -2598,6 +2875,7 @@ async def refresh_registries(repo: str | None = None) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     for reg in registries:
         name = reg.name or reg.repo
+        display_name = _strip_git_target_userinfo(name)
         # Read the (possibly stale) prior index up front so we know which
         # per-app manifest caches this registry contributed, even if the
         # refetch changes/removes some entries.
@@ -2605,8 +2883,8 @@ async def refresh_registries(repo: str | None = None) -> dict[str, Any]:
         # Fetch-then-swap: the cache is overwritten only on a successful fetch.
         entries = await _fetch_and_cache_external_registry(reg)
         if entries is None:
-            failed.append(name)
-            results.append({"name": name, "ok": False})
+            failed.append(display_name)
+            results.append({"name": display_name, "ok": False})
             continue
         # Expire per-app manifest caches so fresh display info is refetched
         # lazily on the next read (mtime expiry preserves the stale fallback).
@@ -2617,8 +2895,8 @@ async def refresh_registries(repo: str | None = None) -> dict[str, Any]:
                 manifest_names.add(entry_name)
         for entry_name in manifest_names:
             await asyncio.to_thread(_expire_cache_file, _manifest_cache_path(entry_name))
-        refreshed.append(name)
-        results.append({"name": name, "ok": True})
+        refreshed.append(display_name)
+        results.append({"name": display_name, "ok": True})
 
     # Re-warm so the response's app count reflects post-refresh state (and
     # untouched registries read their still-valid caches).
@@ -2660,7 +2938,12 @@ async def _detect_installed_probe(
         detect_cmd = entry.get("detectInstalled", "")
         if not detect_cmd:
             continue
-        denied = app_execution_denied(name, action="registry_detect_installed", caller="registry")
+        denied = app_execution_denied(
+            name,
+            action="registry_detect_installed",
+            caller="registry",
+            repository=_entry_git_url(entry),
+        )
         if denied:
             logger.debug("Skipping registry detectInstalled for %s: %s", name, denied)
             continue
@@ -2875,13 +3158,15 @@ async def list_registry() -> list[dict[str, Any]]:
         except Exception:  # noqa: BLE001 - degrade, never 500 the store
             logger.warning("ignoring curated catalog copy after a failure", exc_info=True)
 
+    trust_repositories = _trust_repository_bindings(entries, installed_map)
     return _apply_trust_fields(
-        _enrich_with_install_status(entries, installed_map, detected)
+        _enrich_with_install_status(entries, installed_map, detected),
+        trust_repositories=trust_repositories,
     )
 
 
-def _catalog_installable_names() -> set[Any]:
-    """Names the catalog can install, from a FRESH fetch -- never the local cache.
+def _catalog_installable_rows() -> dict[str, dict[str, Any]]:
+    """Catalog install rows by name, from a FRESH fetch -- never the cache.
 
     ``list_catalog_rows`` reads the cache under the data home, which is
     agent-writable. That is harmless while a cached row only re-dresses a row that
@@ -2897,16 +3182,22 @@ def _catalog_installable_names() -> set[Any]:
     failure memory, so an outage costs a refusal rather than a fresh timeout on
     every listing.
 
-    Returns an empty set on ANY failure, which degrades the storefront to the seed's
-    names -- the listing this path produced before the catalog could supply
-    coordinates. A store listing must never fail because the catalog is unreachable.
+    Returns an empty mapping on ANY failure, which degrades the storefront to the
+    seed's names -- the listing this path produced before the catalog could supply
+    coordinates. Keeping the rows (rather than only their names) also lets the
+    server show the exact resolved clone target in the consent dialog without a
+    second network fetch.
     """
     try:
         entries = official_catalog.fetch_inventory_entries()
-        return {row.get("name") for row in official_catalog.inventory(entries)}
+        return {
+            row["name"]: row
+            for row in official_catalog.inventory(entries)
+            if isinstance(row.get("name"), str)
+        }
     except Exception:  # noqa: BLE001 - degrade to the seed, never 500 the store
         logger.warning("cannot confirm the catalog's install coordinates", exc_info=True)
-        return set()
+        return {}
 
 
 async def list_catalog_apps() -> list[dict[str, Any]]:
@@ -2944,7 +3235,12 @@ async def list_catalog_apps() -> list[dict[str, Any]]:
     if not rows:
         return []
     installable = await asyncio.to_thread(_load_registry_file)
-    installable_names = {e.get("name") for e in installable if isinstance(e, dict)}
+    seed_by_name = {
+        e["name"]: e
+        for e in installable
+        if isinstance(e, dict) and isinstance(e.get("name"), str)
+    }
+    installable_names = set(seed_by_name)
     # Reserve every catalog name BEFORE the git filter, plus every seed name, so
     # an external row can never shadow a catalog/seed name — including a catalog
     # `git` row filtered out here for not being installable yet, whose name
@@ -2960,21 +3256,45 @@ async def list_catalog_apps() -> list[dict[str, Any]]:
     # Only paid when it can change the answer. With every `git` row already seeded
     # the fetch cannot unlock anything, so the storefront's hot path keeps costing
     # one cached read.
+    fresh_installable: dict[str, dict[str, Any]] = {}
     if any(
         row.get("source", {}).get("type") == "git" and row.get("name") not in installable_names
         for row in rows
     ):
-        installable_names |= await asyncio.to_thread(_catalog_installable_names)
+        fresh_installable = await asyncio.to_thread(_catalog_installable_rows)
+        installable_names |= set(fresh_installable)
     rows = [
         row
         for row in rows
         if row.get("source", {}).get("type") != "git" or row.get("name") in installable_names
     ]
 
+    # Catalog display rows intentionally carry no clone URL. Resolve the
+    # consent target from the same install coordinates name-only install uses:
+    # a bundled seed wins a different-repository catalog collision, while a
+    # catalog-only row uses the freshly fetched pin row above.
+    resolved_repositories: dict[str, str] = {}
+    for row in rows:
+        if row.get("source", {}).get("type") != "git":
+            continue
+        name = row.get("name")
+        if not isinstance(name, str):
+            continue
+        install_row = seed_by_name.get(name) or fresh_installable.get(name)
+        resolved_repositories[name] = (
+            _entry_git_url(install_row) if install_row is not None else ""
+        )
+
     installed = await asyncio.to_thread(list_installed_apps)
     installed_map = {a["name"]: a for a in installed}
     rows, detected = await _append_external_registry_apps(rows, reserved_names, installed_map)
-    return _apply_trust_fields(_enrich_with_install_status(rows, installed_map, detected))
+    trust_repositories = _trust_repository_bindings(
+        rows, installed_map, resolved_repositories
+    )
+    return _apply_trust_fields(
+        _enrich_with_install_status(rows, installed_map, detected),
+        trust_repositories=trust_repositories,
+    )
 
 
 def get_server_platform() -> dict[str, str]:
@@ -3020,12 +3340,15 @@ def _resolve_registry_row(name: str) -> tuple[dict[str, Any] | None, str]:
     catalog_failed = False
     try:
         catalog_row = official_catalog.inventory_for_install(name)
-    except official_catalog.CatalogUnavailable as exc:
+    except official_catalog.CatalogUnavailable:
         catalog_failed = True
-        logger.warning("cannot confirm official coordinates for %r: %s", name, exc)
+        # The caller may be classifying a config-derived grant name, and catalog
+        # exceptions may include source coordinates.  Neither belongs in logs;
+        # the fixed classification is enough to explain the fail-closed branch.
+        logger.warning("official catalog coordinate lookup is unavailable")
     except Exception:  # noqa: BLE001 - fail closed: an unexpected error is not "no row"
         catalog_failed = True
-        logger.warning("official catalog lookup failed for %r", name, exc_info=True)
+        logger.warning("official catalog coordinate lookup failed unexpectedly")
 
     if catalog_row is not None and (
         seed_row is None or _catalog_row_supersedes_seed(seed_row, catalog_row)
@@ -3048,9 +3371,9 @@ def _resolve_registry_row(name: str) -> tuple[dict[str, Any] | None, str]:
             else "may be an official catalog app"
         )
         return None, (
-            f"app {name!r} {detail}, but the official catalog could not be reached to "
-            "confirm it — refusing to resolve it from another source. Retry when the "
-            "catalog is reachable."
+            f"the requested app {detail}, but the official catalog could not be "
+            "reached to confirm it — refusing to resolve it from another source. "
+            "Retry when the catalog is reachable."
         )
 
     if seed_row is not None:
@@ -3077,6 +3400,47 @@ def get_registry_app(name: str) -> dict[str, Any] | None:
     if refusal:
         raise official_catalog.CatalogUnavailable(refusal)
     return row
+
+
+def resolve_installed_trust_repository(
+    app: dict[str, Any], *, registry_entry: dict[str, Any] | None = None
+) -> tuple[bool, str]:
+    """Resolve the repository an installed app's trust prompt must bind to.
+
+    New registry installs persist ``sourceUrl`` and are bound directly to that
+    immutable install provenance.  Older installs predate that field, but retain
+    the ``registry:<name>`` source marker; for those records, resolve the same
+    current authoritative row a legacy update would use.  A genuinely local or
+    self-registered app has neither form of registry provenance and remains a
+    valid repository-less app.
+
+    The boolean distinguishes that legitimate local case from a legacy registry
+    record whose current source cannot be resolved.  Callers that grant execution
+    trust must refuse the latter rather than silently creating a name-only grant.
+    A caller that already resolved an authoritative storefront row can pass it as
+    *registry_entry*, avoiding duplicate blocking catalog I/O while keeping the
+    same coordinate precedence. ``CatalogUnavailable`` intentionally propagates
+    when this function must perform the lookup itself, so a caller can fail closed.
+    """
+    source_url = app.get("sourceUrl", "")
+    repository = _normalize_git_target(
+        source_url if isinstance(source_url, str) else ""
+    )
+    if repository:
+        return True, repository
+
+    source = app.get("source", "")
+    if not isinstance(source, str) or not is_registry_source(source):
+        return True, ""
+
+    name = app.get("name", "")
+    if not isinstance(name, str) or not name:
+        return False, ""
+    entry = registry_entry if registry_entry is not None else get_registry_app(name)
+    if entry is None:
+        return False, ""
+    repository = _normalize_git_target(_entry_git_url(entry))
+    return bool(repository), repository
 
 
 def _external_registry_row(name: str) -> dict[str, Any] | None:
@@ -3180,9 +3544,15 @@ def _pinned_registry_entry(name: str, meta: dict[str, Any]) -> dict[str, Any] | 
     want_url = str(meta.get("sourceUrl", "") or "")
     want_registry = str(meta.get("sourceRegistry", "") or "")
     for entry in _registry_app_candidates(name):
-        if _entry_git_url(entry) != want_url:
+        # Credentials select how git fetches the source; they are not the source
+        # identity. Rotation from one userinfo value to another must neither
+        # rebind the grant nor strand an update of the same repository.
+        if not _same_git_target(_entry_git_url(entry), want_url):
             continue
-        if str(entry.get("_registry", "") or "") != want_registry:
+        current_registry = str(entry.get("_registry", "") or "")
+        if current_registry != want_registry and not _same_git_target(
+            current_registry, want_registry
+        ):
             continue
         return entry
     return None
@@ -3213,9 +3583,11 @@ def _resolve_install_entry(name: str) -> tuple[dict[str, Any] | None, str]:
             return None, str(exc)
     entry = _pinned_registry_entry(name, meta)
     if entry is None:
+        # ``pinned_url`` can contain clone credentials. It is comparison state,
+        # never API/audit text: the caller returns and SEL-logs this reason.
         return None, (
-            f"app {name!r} was installed from {pinned_url} and no registry entry "
-            f"currently offers that source — refusing to update it from a different source"
+            f"app {name!r} has no registry entry that matches its recorded source "
+            "— refusing to update it from a different source"
         )
     return entry, ""
 
@@ -3229,7 +3601,11 @@ def _external_registry_app_by_repo(repo: str) -> dict[str, Any] | None:
         for reg in _effective_registries():
             cached = _read_external_registry_cache(reg.name or reg.repo, ignore_ttl=True)
             for entry in cached or []:
-                if isinstance(entry, dict) and entry.get("repo") == repo:
+                if (
+                    isinstance(entry, dict)
+                    and isinstance(entry.get("repo"), str)
+                    and _same_git_target(entry["repo"], repo)
+                ):
                     _apply_configured_branch([entry], reg)
                     return entry
     except Exception:  # fail open: branch resolution must never break blob serving
@@ -3246,7 +3622,7 @@ def get_registry_app_by_repo(repo: str) -> dict[str, Any] | None:
     ref in the ``/api/apps/blob`` branch fallback instead of silently 403ing.
     """
     for entry in _load_registry_file():
-        if entry.get("repo") == repo:
+        if isinstance(entry.get("repo"), str) and _same_git_target(entry["repo"], repo):
             return entry
     return _external_registry_app_by_repo(repo)
 
@@ -3274,8 +3650,12 @@ def _external_registry_repos() -> set[str]:
         for reg in _effective_registries():
             cached = _read_external_registry_cache(reg.name or reg.repo, ignore_ttl=True)
             for entry in cached or []:
-                if isinstance(entry, dict) and entry.get("repo"):
-                    repos.add(entry["repo"])
+                if (
+                    isinstance(entry, dict)
+                    and isinstance(entry.get("repo"), str)
+                    and entry["repo"]
+                ):
+                    repos.add(_strip_git_target_userinfo(entry["repo"]))
     except Exception:  # fail open: the allowlist must never break blob serving
         logger.debug("_external_registry_repos: read failed", exc_info=True)
     return repos
@@ -3288,7 +3668,11 @@ def known_registry_repos() -> set[str]:
     registries — external-registry apps resolve an ``/api/apps/blob`` iconUrl,
     so their repos must be allowlisted here or the App Store icon 403s.
     """
-    bundled = {e["repo"] for e in _load_registry_file() if e.get("repo")}
+    bundled = {
+        _strip_git_target_userinfo(e["repo"])
+        for e in _load_registry_file()
+        if isinstance(e.get("repo"), str) and e["repo"]
+    }
     return bundled | _external_registry_repos()
 
 
@@ -3453,7 +3837,10 @@ async def _refuse_identity_mismatch(
             caller="app_install_from_registry",
             operation="identity_mismatch",
             outcome="rejected",
-            resources=f"name={entry_name!r} declared={declared!r} repo={repo}",
+            resources=(
+                f"name={entry_name!r} declared={declared!r} "
+                f"repo={_strip_git_target_userinfo(repo)}"
+            ),
             error="cloned manifest name does not match registry entry name",
         )
     except Exception as exc:  # an audit failure must never mask the refusal
@@ -3583,14 +3970,16 @@ async def _clone_origin_url(dest: Path) -> str | None:
 
 
 async def _clone_origin_matches(dest: Path, git_url: str) -> bool:
-    """Whether *dest* is a checkout of *git_url* (byte-identical origin).
+    """Whether *dest* is a checkout of the same repository as *git_url*.
 
     Fails closed: an unreadable origin, a missing remote, or an empty
-    *git_url* to compare against all return False.
+    *git_url* to compare against all return False. Embedded userinfo is transport
+    authentication rather than identity, so credential rotation remains a match.
     """
     if not git_url:
         return False
-    return await _clone_origin_url(dest) == git_url
+    origin = await _clone_origin_url(dest)
+    return origin is not None and _same_git_target(origin, git_url)
 
 
 # Upper bound on any single git-metadata read of a file INSIDE a checkout
@@ -3745,6 +4134,7 @@ async def _git_fetch_commit(
     dest: Path,
     log_lines: list[str],
     *,
+    credential_target: str | None = None,
     clone_env: dict[str, str],
     sandbox_mode: str,
 ) -> dict[str, Any] | None:
@@ -3776,9 +4166,25 @@ async def _git_fetch_commit(
     the checkout below would then execute ``post-checkout``.
     """
 
-    async def run(argv: list[str], *, cwd: Path | None = None, timeout: int) -> tuple[int, str]:
+    if _strip_git_target_userinfo(git_url) != git_url:
+        raise ValueError("_git_fetch_commit requires a credential-free git_url")
+    credential_target = credential_target or git_url
+    if _strip_git_target_userinfo(credential_target) != git_url:
+        raise ValueError("credential_target does not match git_url")
+    credentialed_transport = credential_target != git_url
+
+    async def run(
+        argv: list[str],
+        *,
+        cwd: Path | None = None,
+        timeout: int,
+        network: bool = False,
+    ) -> tuple[int, str]:
         sandboxed, _cleanup = wrap_argv(argv, mode=sandbox_mode)
         sandboxed = cgroup_scope_argv(sandboxed)
+        process_env = (
+            _git_transport_env(credential_target, git_url, clone_env) if network else clone_env
+        )
         proc = await create_subprocess_limited(
             *sandboxed,
             cwd=str(cwd) if cwd else None,
@@ -3786,7 +4192,7 @@ async def _git_fetch_commit(
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=platform_compat.IS_POSIX,
             creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
-            env=clone_env,
+            env=process_env,
         )
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -3796,7 +4202,13 @@ async def _git_fetch_commit(
         except asyncio.CancelledError:
             await _kill_process_group(proc)
             raise
-        return proc.returncode or 0, out.decode(errors="replace").strip()
+        return (
+            proc.returncode or 0,
+            _loggable_git_transport_output(
+                out.decode(errors="replace").strip(),
+                credentialed=credentialed_transport if network else False,
+            ),
+        )
 
     # Hardening applied to the network step. None of these are set anywhere on
     # the existing clone paths; the fetch is where an attacker-influenced URL
@@ -3809,7 +4221,6 @@ async def _git_fetch_commit(
         "-c",
         "fetch.recurseSubmodules=no",
     ]
-
     # Destination lifecycle, stated as one invariant because three reviewer findings
     # were three exits from the same mistake:
     #
@@ -3858,24 +4269,29 @@ async def _git_fetch_commit(
             # fail, or the spawn itself may raise, and either way the directory is
             # ours to discard.
             created_here = True
-            code, out = await run(
-                ["git", "init", "--quiet", "--template=", str(dest)], timeout=15
-            )
+            code, out = await run(["git", "init", "--quiet", "--template=", str(dest)], timeout=15)
             if code != 0:
                 log_lines.append(f"git init failed (exit {code}): {out}")
                 return {"ok": False, "name": dest.name, "error": "git init failed"}
-            code, out = await run(
-                ["git", "remote", "add", "origin", git_url], cwd=dest, timeout=15
-            )
+            code, out = await run(["git", "remote", "add", "origin", git_url], cwd=dest, timeout=15)
             if code != 0:
                 log_lines.append(f"git remote add failed (exit {code}): {out}")
                 return {"ok": False, "name": dest.name, "error": "git remote add failed"}
 
-        log_lines.append(f"Fetching {git_url} at {commit[:12]}...")
+        log_lines.append(f"Fetching {_strip_git_target_userinfo(git_url)} at {commit[:12]}...")
         code, out = await run(
-            ["git", *hardening, "fetch", "--depth", "1", "origin", commit],
+            [
+                "git",
+                *hardening,
+                "fetch",
+                "--depth",
+                "1",
+                git_url,
+                commit,
+            ],
             cwd=dest,
             timeout=_CLONE_TIMEOUT,
+            network=True,
         )
         log_lines.append(out)
         if code != 0:
@@ -4020,14 +4436,21 @@ async def _git_clone_or_pull(
     dest: Path,
     log_lines: list[str],
     *,
+    credential_target: str | None = None,
     index_originated: bool = False,
     pending_cleanup: list[Path] | None = None,
     restorable_stale: list[Path] | None = None,
     commit: str = "",
 ) -> dict[str, Any] | None:
-    """Clone *git_url* into *dest*, or fast-forward it if already present.
+    """Clone credential-free *git_url*, or fast-forward it if already present.
 
     Returns None on success, or a ``{"ok": False, ...}`` error dict on failure.
+
+    ``credential_target`` may carry embedded userinfo for the network request,
+    but it is deliberately separate from *git_url*: the latter is repository
+    identity and the only target allowed into sandbox argv, diagnostics, stored
+    origin, and logs. The raw target reaches only the per-network-call transport
+    environment created after :func:`wrap_argv` returns.
 
     If *pending_cleanup* is provided (a mutable list), any moved-aside directory
     that should be deleted after the caller's full install transaction succeeds
@@ -4052,6 +4475,13 @@ async def _git_clone_or_pull(
     hidden), so a hostile index entry pointing at a private *sibling* repo on the
     owner's own trusted forge cannot be read with the gateway's identity.
     """
+    if _strip_git_target_userinfo(git_url) != git_url:
+        raise ValueError("_git_clone_or_pull requires a credential-free git_url")
+    credential_target = credential_target or git_url
+    if _strip_git_target_userinfo(credential_target) != git_url:
+        raise ValueError("credential_target does not match git_url")
+    credentialed_transport = credential_target != git_url
+
     clone_env = anonymous_git_env() if index_originated else minimal_env()
     sandbox_mode = "strict" if index_originated else _context_clone_sandbox_mode(git_url)
     # SSRF gate: refuse to clone/pull from a host the owner does not explicitly
@@ -4060,7 +4490,10 @@ async def _git_clone_or_pull(
     # a loopback/internal destination it could inject. is_clone_host_trusted()
     # loads config from disk, so run it off the event loop.
     if not await asyncio.to_thread(is_clone_host_trusted, git_url):
-        log_lines.append(f"Refusing clone: host of {git_url!r} is not a trusted forge/registry")
+        log_lines.append(
+            "Refusing clone: host of "
+            f"{_strip_git_target_userinfo(git_url)!r} is not a trusted forge/registry"
+        )
         return {
             "ok": False,
             # Human sentence in `error`, machine slug in `code`: the install
@@ -4083,9 +4516,11 @@ async def _git_clone_or_pull(
         # clone pulls from ITS OWN `origin`, which can be a different URL
         # (e.g. a registry replaced with the same app name leaves the old
         # clone behind). Never run a credentialed pull against an unverified
-        # remote: require the existing origin to be byte-identical to the
-        # vetted git_url, otherwise move the stale clone aside and re-clone
-        # from the URL the posture decision was actually made for.
+        # remote: require the existing origin to resolve to the same clone
+        # target as the vetted git_url. Userinfo is deliberately ignored here:
+        # credential rotation must not turn the same repository into a rebind.
+        # Any other mismatch moves the stale clone aside and re-clones from the
+        # URL the posture decision was actually made for.
         #
         # The same origin check gates the manifest that admission ran on (see
         # _fetch_app_manifest), so the re-clone below cannot swap in code that
@@ -4115,14 +4550,16 @@ async def _git_clone_or_pull(
                     f"Remove or fix it manually at {dest} and retry the install."
                 ),
             }
-        if existing_origin != git_url:
+        if not _same_git_target(existing_origin, git_url):
             # Parity with the branch-mismatch path below: say WHY the checkout
             # is being replaced before doing it, naming the mismatched origin,
             # so the install log records the re-clone reason instead of a bare
             # move-aside line.
             log_lines.append(
-                f"Existing clone origin {existing_origin!r} does not match "
-                f"{git_url!r}; moving aside stale clone for re-clone"
+                "Existing clone origin "
+                f"{_strip_git_target_userinfo(existing_origin)!r} does not match "
+                f"{_strip_git_target_userinfo(git_url)!r}; moving aside stale clone "
+                "for re-clone"
             )
             # Move aside with an atomic same-filesystem rename into a sibling
             # temp path under the app-sources root. If rename fails (e.g. locked
@@ -4256,19 +4693,23 @@ async def _git_clone_or_pull(
             # Already cloned from the verified origin AND branch (or the branch
             # state was unknown and re-convergence was skipped) — fetch and
             # fast-forward. (The origin-mismatch gate above guarantees this
-            # checkout's origin is byte-identical to git_url: a mismatched
-            # checkout was moved aside and never reused, so the fetch source and
-            # the provenance record are the same URL by construction.)
-            log_lines.append(f"Updating {git_url} (branch: {branch})...")
+            # checkout's origin is the same normalized target as git_url: a
+            # mismatched checkout was moved aside and never reused. Pull from the
+            # current registry URL through the command-scoped rewrite, so rotated
+            # credentials take effect without ever being persisted in origin.)
+            log_lines.append(
+                f"Updating {_strip_git_target_userinfo(git_url)} (branch: {branch})..."
+            )
             # Route through wrap_argv (OS sandbox) THEN cgroup_scope_argv, matching
             # the fresh-clone path below — the cgroup DoS ceiling is the outermost
             # layer but must not replace the wrap_argv sandbox on this
             # agent-influenced git spawn.
             pull_cmd, _cleanup = wrap_argv(
-                ["git", "pull", "--ff-only", "origin", branch],
+                ["git", "pull", "--ff-only", git_url, branch],
                 mode=sandbox_mode,
             )
             pull_cmd = cgroup_scope_argv(pull_cmd)
+            pull_env = _git_transport_env(credential_target, git_url, clone_env)
             proc = await create_subprocess_limited(
                 *pull_cmd,
                 cwd=str(dest),
@@ -4276,11 +4717,16 @@ async def _git_clone_or_pull(
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=platform_compat.IS_POSIX,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
-                env=clone_env,
+                env=pull_env,
             )
             try:
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-                log_lines.append(stdout.decode(errors="replace").strip())
+                log_lines.append(
+                    _loggable_git_transport_output(
+                        stdout.decode(errors="replace").strip(),
+                        credentialed=credentialed_transport,
+                    )
+                )
                 if proc.returncode != 0:
                     # Fail closed: installing whatever the checkout happens to hold
                     # while persisting the catalog URL as its provenance would
@@ -4317,6 +4763,7 @@ async def _git_clone_or_pull(
                 commit,
                 dest,
                 log_lines,
+                credential_target=credential_target,
                 clone_env=clone_env,
                 sandbox_mode=sandbox_mode,
             )
@@ -4325,7 +4772,7 @@ async def _git_clone_or_pull(
             clone_succeeded = True
             return None
 
-        log_lines.append(f"Cloning {git_url} (branch: {branch})...")
+        log_lines.append(f"Cloning {_strip_git_target_userinfo(git_url)} (branch: {branch})...")
         dest.parent.mkdir(parents=True, exist_ok=True)
         clone_cmd = [
             "git",
@@ -4340,6 +4787,7 @@ async def _git_clone_or_pull(
         ]
         sandboxed_cmd, _cleanup = wrap_argv(clone_cmd, mode=sandbox_mode)
         sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
+        transport_env = _git_transport_env(credential_target, git_url, clone_env)
 
         proc = await create_subprocess_limited(
             *sandboxed_cmd,
@@ -4347,7 +4795,7 @@ async def _git_clone_or_pull(
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=platform_compat.IS_POSIX,
             creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
-            env=clone_env,
+            env=transport_env,
         )
         # `rmtree_force`, never `shutil.rmtree(..., ignore_errors=True)`: what a
         # half-finished `git clone` leaves at *dest* is a git checkout, and git
@@ -4366,7 +4814,10 @@ async def _git_clone_or_pull(
         clone_output = ""
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_CLONE_TIMEOUT)
-            clone_output = stdout.decode(errors="replace").strip()
+            clone_output = _loggable_git_transport_output(
+                stdout.decode(errors="replace").strip(),
+                credentialed=credentialed_transport,
+            )
             log_lines.append(clone_output)
         except asyncio.TimeoutError:
             await _kill_process_group(proc)
@@ -4796,11 +5247,13 @@ async def _clone_build_app_locked(
     optional-with-``None`` shape would only invite a caller to drop the list
     and silently lose that state, so there is no default to fall back to.
     """
+    credential_target = git_url
+    git_url = _strip_git_target_userinfo(credential_target)
     if not _looks_like_git_url(git_url):
         return {
             "ok": False,
             "name": app_name,
-            "error": f"{git_url!r} is not a cloneable git URL",
+            "error": (f"{_strip_git_target_userinfo(git_url)!r} is not a cloneable git URL"),
         }
 
     pkg_dir = app_source_dir(app_name)
@@ -4832,6 +5285,7 @@ async def _clone_build_app_locked(
         branch,
         pkg_dir,
         log_lines,
+        credential_target=credential_target,
         index_originated=index_originated,
         pending_cleanup=pending_cleanup,
         restorable_stale=restorable_stale,
@@ -5306,24 +5760,37 @@ async def install_from_registry(
     git_url = _entry_git_url(entry)
     if not git_url:
         return {"ok": False, "error": f"app {name!r} has no git URL configured"}
+    persisted_git_url = _strip_git_target_userinfo(git_url)
 
     # A per-app execution grant is consent to the repository the operator saw,
     # not to whichever repository later claims the same app name. New grants
-    # record that coordinate; legacy grants have no record and intentionally
-    # keep their historical name-only behaviour. This gate runs before manifest
-    # fetch, credential selection, clone, build, or setup code.
+    # record that coordinate; a legacy name-only grant needs one-time re-consent
+    # before repository-backed bytes can be fetched or executed. This gate runs
+    # before manifest fetch, credential selection, clone, build, or setup code.
     granted_repository = trusted_app_repository(name)
-    if granted_repository and not _same_git_target(granted_repository, git_url):
-        reason = (
-            f"execution trust for app {name!r} was granted for repository "
-            f"{granted_repository!r}, but the registry now resolves it to "
-            f"{git_url!r}; revoke the existing grant and grant it again after "
-            "reviewing the new repository"
+    trust_denied = repository_bound_grant_denied(name, repository=git_url)
+    if trust_denied:
+        # The exact coordinates are comparison inputs, not log/API data. Clone
+        # URLs can contain userinfo credentials; every copy of this reason is
+        # audited or returned to the dashboard, so keep it credential-free.
+        reason = trust_denied
+        # A bound mismatch must first be revoked. A legacy unbound grant instead
+        # needs the normal consent dialog, whose stable trigger is the execution
+        # denial code. Keep both existing wire behaviours explicit.
+        code = (
+            "app_trust_repository_mismatch"
+            if granted_repository
+            else "app_execution_denied"
+        )
+        audit_operation = (
+            "trust_repository_mismatch"
+            if granted_repository
+            else "trust_repository_binding_required"
         )
         try:
             sel().log_api_access(
                 caller="app_install_from_registry",
-                operation="trust_repository_mismatch",
+                operation=audit_operation,
                 outcome="rejected",
                 resources=f"name={name!r}",
                 error=reason,
@@ -5334,10 +5801,11 @@ async def install_from_registry(
             "ok": False,
             "name": name,
             "error": reason,
-            "code": "app_trust_repository_mismatch",
+            "code": code,
         }
 
-    repo = entry.get("repo", "")
+    raw_repo = entry.get("repo", "")
+    repo = _strip_git_target_userinfo(raw_repo) if isinstance(raw_repo, str) else ""
     branch = entry.get("branch", "main")
     subdirectory = entry.get("subdirectory", "")
     # Pinning is a CATALOG mechanism, so the pin is read only for a catalog row.
@@ -5433,7 +5901,7 @@ async def install_from_registry(
     # the bundled (KiroCrew-shipped) catalog, which is itself a distinct source.
     # Captured BEFORE the owner-designated carve-out (same reasoning as above):
     # the entry still came from that external registry, and provenance must say so.
-    source_registry = str(entry.get("_registry", "") or "")
+    source_registry = _strip_git_target_userinfo(str(entry.get("_registry", "") or ""))
     if index_originated and await asyncio.to_thread(_is_owner_designated_repo, entry):
         index_originated = False
         _sel_credential_grant("install_from_registry", _entry_git_url(entry) or "")
@@ -5531,7 +5999,12 @@ async def install_from_registry(
 
     # detectInstalled, clone/build, dependency setup, and onInstall are all
     # executable third-party surfaces and share the same explicit admission.
-    execution_denied = app_execution_denied(name, action="registry_install", caller="registry")
+    execution_denied = app_execution_denied(
+        name,
+        action="registry_install",
+        caller="registry",
+        repository=git_url,
+    )
     if execution_denied:
         return {
             "ok": False,
@@ -5716,7 +6189,7 @@ async def install_from_registry(
             outcome = await _refuse_identity_mismatch(
                 name,
                 str((manifest_data or {}).get("name", "") or ""),
-                repo,
+                _strip_git_target_userinfo(repo),
                 clone_root,
                 log_lines,
                 created_this_run=not bool(build_result.get("_checkout_preexisted")),
@@ -5794,14 +6267,14 @@ async def install_from_registry(
             logger.info(
                 "Executing sandboxed install script for app %s from repo %s",
                 name,
-                repo,
+                _strip_git_target_userinfo(repo),
             )
             try:
                 sel().log_api_access(
                     caller="registry",
                     operation="app_install_script",
                     outcome="started",
-                    resources=f"{name} repo={repo}",
+                    resources=f"{name} repo={_strip_git_target_userinfo(repo)}",
                 )
             except Exception as exc:
                 logger.debug("SEL audit failed for app %s install: %s", name, exc)
@@ -5900,7 +6373,7 @@ async def install_from_registry(
                 outcome = await _refuse_identity_mismatch(
                     name,
                     str((manifest_data or {}).get("name", "") or ""),
-                    repo,
+                    _strip_git_target_userinfo(repo),
                     clone_root,
                     log_lines,
                     created_this_run=not bool(build_result.get("_checkout_preexisted")),
@@ -6020,12 +6493,13 @@ async def install_from_registry(
                 source=f"{SOURCE_REGISTRY_PREFIX}{name}",
                 manifest_data=manifest_data,
                 origin="registry",
+                source_repository=persisted_git_url,
             )
             if reg_result.ok:
                 set_app_provenance(
                     name,
                     source=f"{SOURCE_REGISTRY_PREFIX}{name}",
-                    url=git_url,
+                    url=persisted_git_url,
                     registry=source_registry,
                     commit=source_commit,
                     signer=source_signer,
@@ -6049,7 +6523,10 @@ async def install_from_registry(
             outcome = {
                 "ok": True,
                 "name": name,
-                "message": f"installed {name} from {repo} (self-managed)",
+                "message": (
+                    f"installed {name} from {_strip_git_target_userinfo(repo)} "
+                    "(self-managed)"
+                ),
             }
             return outcome
 
@@ -6063,9 +6540,17 @@ async def install_from_registry(
         # that can take minutes on large source trees — on the loop it
         # would trip the loop-stall watchdog and kill the gateway.
         if existing:
-            result = await asyncio.to_thread(update_app, str(app_source))
+            result = await asyncio.to_thread(
+                update_app,
+                str(app_source),
+                source_repository=persisted_git_url,
+            )
         else:
-            result = await asyncio.to_thread(install_app, str(app_source))
+            result = await asyncio.to_thread(
+                install_app,
+                str(app_source),
+                source_repository=persisted_git_url,
+            )
         log_lines.append(result.message or result.error or "done")
 
         # Record the source marker plus structured provenance, so a later update
@@ -6085,7 +6570,7 @@ async def install_from_registry(
             set_app_provenance(
                 result.name,
                 source=f"{SOURCE_REGISTRY_PREFIX}{name}",
-                url=git_url,
+                url=persisted_git_url,
                 registry=source_registry,
                 commit=source_commit,
                 signer=source_signer,

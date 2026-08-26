@@ -1284,6 +1284,156 @@ class TestCopyAppTree:
         assert not (orphan / "leftover.bin").exists()
         assert (orphan / APP_MANIFEST_FILENAME).is_file()
 
+    def test_local_install_cannot_claim_a_repository_bound_grant(
+        self, tmp_path, app_home
+    ):
+        from kiro_crew.config.loader import _invalidate_config_cache
+
+        reviewed = "https://clone.example.test/Owner/reviewed-app"
+        (app_home / "config.json").write_text(
+            json.dumps(
+                {
+                    "agent": {
+                        "apps_allow_third_party": False,
+                        "apps_trusted": ["test-app"],
+                        "apps_trusted_repositories": {"test-app": reviewed},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        _invalidate_config_cache()
+
+        result = install_app(_make_app_source(tmp_path))
+
+        assert not result.ok
+        assert result.error_code == "app_trust_repository_mismatch"
+        assert get_app("test-app") is None
+
+    def test_external_registration_cannot_claim_a_repository_bound_grant(
+        self, app_home
+    ):
+        from kiro_crew.config.loader import _invalidate_config_cache
+
+        reviewed = "https://clone.example.test/Owner/reviewed-app"
+        (app_home / "config.json").write_text(
+            json.dumps(
+                {
+                    "agent": {
+                        "apps_allow_third_party": False,
+                        "apps_trusted": ["test-app"],
+                        "apps_trusted_repositories": {"test-app": reviewed},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        _invalidate_config_cache()
+
+        result = register_external_app("test-app", "1.0.0", "Rebound App")
+
+        assert not result.ok
+        assert result.error_code == "app_trust_repository_mismatch"
+        assert get_app("test-app") is None
+
+    def test_legacy_name_grant_cannot_install_repository_code(
+        self, tmp_path, app_home
+    ):
+        from kiro_crew.config.loader import _invalidate_config_cache
+
+        (app_home / "config.json").write_text(
+            json.dumps({"agent": {"apps_trusted": ["test-app"]}}),
+            encoding="utf-8",
+        )
+        _invalidate_config_cache()
+
+        result = install_app(
+            _make_app_source(tmp_path),
+            source_repository="https://User:Secret@example.test/owner/repo",
+        )
+
+        assert not result.ok
+        assert result.error_code == "app_trust_repository_mismatch"
+        assert "Secret" not in result.error
+        assert get_app("test-app") is None
+
+    def test_legacy_name_grant_cannot_claim_fresh_local_install(
+        self, tmp_path, app_home
+    ):
+        from kiro_crew.config.loader import _invalidate_config_cache
+
+        (app_home / "config.json").write_text(
+            json.dumps({"agent": {"apps_trusted": ["test-app"]}}),
+            encoding="utf-8",
+        )
+        _invalidate_config_cache()
+
+        result = install_app(_make_app_source(tmp_path))
+
+        assert not result.ok
+        assert result.error_code == "app_trust_repository_mismatch"
+        assert get_app("test-app") is None
+
+    def test_legacy_name_grant_cannot_update_to_repository_code(
+        self, tmp_path, app_home
+    ):
+        from kiro_crew.apps.manager import update_app
+        from kiro_crew.config.loader import _invalidate_config_cache
+
+        assert install_app(_make_app_source(tmp_path)).ok
+        (app_home / "config.json").write_text(
+            json.dumps({"agent": {"apps_trusted": ["test-app"]}}),
+            encoding="utf-8",
+        )
+        _invalidate_config_cache()
+
+        result = update_app(
+            _make_app_source(tmp_path / "v2", version="2.0.0"),
+            source_repository="https://example.test/owner/repo",
+        )
+
+        assert not result.ok
+        assert result.error_code == "app_trust_repository_mismatch"
+        assert get_app("test-app")["version"] == "1.0.0"
+
+    def test_legacy_name_grant_cannot_register_repository_code(self, app_home):
+        from kiro_crew.config.loader import _invalidate_config_cache
+
+        (app_home / "config.json").write_text(
+            json.dumps({"agent": {"apps_trusted": ["test-app"]}}),
+            encoding="utf-8",
+        )
+        _invalidate_config_cache()
+
+        result = register_external_app(
+            "test-app",
+            "1.0.0",
+            "Legacy Rebind",
+            source_repository="https://example.test/owner/repo",
+        )
+
+        assert not result.ok
+        assert result.error_code == "app_trust_repository_mismatch"
+        assert get_app("test-app") is None
+
+    def test_installed_legacy_local_grant_can_update_local_code(
+        self, tmp_path, app_home
+    ):
+        from kiro_crew.apps.manager import update_app
+        from kiro_crew.config.loader import _invalidate_config_cache
+
+        assert install_app(_make_app_source(tmp_path)).ok
+        (app_home / "config.json").write_text(
+            json.dumps({"agent": {"apps_trusted": ["test-app"]}}),
+            encoding="utf-8",
+        )
+        _invalidate_config_cache()
+
+        result = update_app(_make_app_source(tmp_path / "v2", version="2.0.0"))
+
+        assert result.ok, result.error
+        assert get_app("test-app")["version"] == "2.0.0"
+
     def test_update_preserves_data_and_secret(self, tmp_path, app_home):
         from kiro_crew.apps.manager import app_dir, update_app
 
@@ -1300,6 +1450,36 @@ class TestCopyAppTree:
         assert result.ok, result.error
         assert (dest / "data" / "state.json").read_text(encoding="utf-8") == '{"k": 1}'
         assert secret.read_text(encoding="utf-8") == "s3cret"
+
+    def test_local_update_clears_prior_registry_provenance(self, tmp_path, app_home):
+        from kiro_crew.apps.manager import (
+            _read_installed,
+            set_app_provenance,
+            update_app,
+        )
+
+        src = _make_app_source(tmp_path)
+        assert install_app(src).ok
+        assert set_app_provenance(
+            "test-app",
+            source="registry:test-app",
+            url="https://clone.example.test/Owner/reviewed-app",
+            registry="corp",
+            commit="a" * 40,
+            signer="release-key",
+        )
+
+        local_v2 = _make_app_source(tmp_path / "local-v2", version="2.0.0")
+        result = update_app(local_v2)
+        assert result.ok, result.error
+
+        meta = _read_installed("test-app")
+        assert meta is not None
+        assert meta.source == str(local_v2.resolve())
+        assert meta.sourceUrl == ""
+        assert meta.sourceRegistry == ""
+        assert meta.sourceCommit == ""
+        assert meta.sourceSigner == ""
 
     def test_directory_junction_omitted(self, tmp_path, app_home, monkeypatch):
         """Windows directory junctions (reparse points not reported by

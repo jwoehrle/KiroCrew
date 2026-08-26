@@ -467,7 +467,9 @@ async def test_provenance_signer_comes_from_cloned_manifest(monkeypatch, tmp_pat
     monkeypatch.setattr(
         registry,
         "install_app",
-        lambda path: MagicMock(ok=True, name="demoapp", message="done", error=""),
+        lambda path, **kwargs: MagicMock(
+            ok=True, name="demoapp", message="done", error=""
+        ),
     )
 
     result = await registry.install_from_registry("demoapp")
@@ -478,6 +480,43 @@ async def test_provenance_signer_comes_from_cloned_manifest(monkeypatch, tmp_pat
     assert getattr(signer_calls[0], "version", "") == "9.9.9"
     assert provenance["signer"] == "cloned-signer"
     assert provenance["commit"] == "a" * 40
+
+
+@pytest.mark.asyncio
+async def test_install_persists_credential_free_source_provenance(monkeypatch, tmp_path):
+    secret = "InstalledSourceSecret"
+    raw_url = f"https://user:{secret}@example.com/o/demo.git"
+    public_url = "https://example.com/o/demo.git"
+    src = tmp_path / "app-sources" / "demoapp"
+    _identity_harness(
+        monkeypatch,
+        src,
+        cloned_manifest={"name": "demoapp", "version": "1.0.0"},
+    )
+    monkeypatch.setattr(registry, "_entry_git_url", lambda entry: raw_url)
+    monkeypatch.setattr(registry, "_resolved_clone_commit", lambda root: "a" * 40)
+    monkeypatch.setattr(registry, "verified_signer", lambda manifest: "")
+    monkeypatch.setattr(registry, "get_app", lambda name: None)
+    installed: dict[str, object] = {}
+    provenance: dict[str, object] = {}
+
+    def _install(path, **kwargs):
+        installed.update(kwargs)
+        return MagicMock(ok=True, name="demoapp", message="done", error="")
+
+    monkeypatch.setattr(registry, "install_app", _install)
+    monkeypatch.setattr(
+        registry,
+        "set_app_provenance",
+        lambda name, **kwargs: provenance.update(kwargs, name=name),
+    )
+
+    result = await registry.install_from_registry("demoapp")
+
+    assert result["ok"] is True
+    assert installed["source_repository"] == public_url
+    assert provenance["url"] == public_url
+    assert secret not in str({"installed": installed, "provenance": provenance})
 
 
 @pytest.mark.asyncio
@@ -661,9 +700,7 @@ async def test_cloned_manifest_admission_is_revalidated_before_build(monkeypatch
 
     monkeypatch.setattr(registry, "_run_app_build", _fake_run_build)
 
-    result = await registry._clone_build_app(
-        "https://example.com/demo.git", "demoapp", []
-    )
+    result = await registry._clone_build_app("https://example.com/demo.git", "demoapp", [])
 
     assert result["ok"] is False
     assert "admission" in result["error"]
@@ -706,13 +743,131 @@ async def test_reused_checkout_pull_never_repoints_origin(monkeypatch, tmp_path)
     monkeypatch.setattr(registry, "wrap_argv", lambda cmd, mode="": (cmd, None))
     monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: cmd)
 
-    err = await registry._git_clone_or_pull(
-        "https://example.com/new-home.git", "main", dest, []
-    )
+    err = await registry._git_clone_or_pull("https://example.com/new-home.git", "main", dest, [])
 
     assert err is None
     assert spawned[0][:2] == ["git", "pull"]
     assert not any(cmd[:3] == ["git", "remote", "set-url"] for cmd in spawned)
+
+
+@pytest.mark.asyncio
+async def test_clone_stream_never_emits_embedded_credentials(monkeypatch, tmp_path):
+    secret = "StreamingCloneSecret"
+    raw_url = f"https://user:{secret}@example.com/o/demo.git"
+    public_url = "https://example.com/o/demo.git"
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    log_lines = registry.StreamingLogLines(queue)
+    spawned: list[tuple[list[str], dict[str, object]]] = []
+
+    monkeypatch.setattr(registry, "is_clone_host_trusted", lambda url: True)
+    monkeypatch.setattr(registry, "wrap_argv", lambda cmd, mode="": (cmd, None))
+    monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: cmd)
+
+    class _Proc:
+        returncode = 1
+        pid = 4242
+
+        async def communicate(self):
+            return f"fatal: unable to access {raw_url}".encode(), b""
+
+    async def _fake_spawn(*argv, **kwargs):
+        spawned.append((list(argv), kwargs))
+        return _Proc()
+
+    monkeypatch.setattr(registry, "create_subprocess_limited", _fake_spawn)
+
+    result = await registry._git_clone_or_pull(
+        public_url,
+        "main",
+        tmp_path / "demo",
+        log_lines,
+        credential_target=raw_url,
+    )
+    streamed = []
+    while not queue.empty():
+        streamed.append(queue.get_nowait())
+    visible = "\n".join([*log_lines, *streamed, str(result)])
+
+    assert secret not in visible
+    assert raw_url not in visible
+    assert public_url in visible
+    assert "git transport output redacted (credentialed remote)" in visible
+    # The network mapping may carry the raw credential in process memory, but
+    # clone receives the public target and therefore records a safe origin URL.
+    assert spawned
+    clone_argv, spawn_kwargs = spawned[0]
+    assert clone_argv[-2] == public_url
+    assert secret not in "\n".join(clone_argv)
+    transport_env = spawn_kwargs["env"]
+    assert isinstance(transport_env, dict)
+    count = int(transport_env["GIT_CONFIG_COUNT"])
+    assert transport_env[f"GIT_CONFIG_KEY_{count - 1}"] == (f"url.{raw_url}.insteadOf")
+    assert transport_env[f"GIT_CONFIG_VALUE_{count - 1}"] == public_url
+
+
+@pytest.mark.asyncio
+async def test_pinned_fetch_isolates_credentials_to_network_transport(monkeypatch, tmp_path):
+    """Only the fetch subprocess receives the command-scoped auth mapping.
+
+    The generic sandbox boundary and the three local git operations see only
+    the credential-free repository identity and base environment.
+    """
+    secret = "PinnedFetchSecret"
+    raw_url = f"https://user:{secret}@example.com/o/demo.git"
+    public_url = "https://example.com/o/demo.git"
+    dest = tmp_path / "demo"
+    commit = "a" * 40
+    spawned: list[tuple[list[str], dict[str, object]]] = []
+    wrapped: list[list[str]] = []
+
+    def _fake_wrap(cmd, mode=""):
+        wrapped.append(list(cmd))
+        return cmd, None
+
+    class _Proc:
+        returncode = 0
+        pid = 4242
+
+        async def communicate(self):
+            return b"", b""
+
+    async def _fake_spawn(*argv, **kwargs):
+        spawned.append((list(argv), kwargs))
+        if "init" in argv:
+            (dest / ".git").mkdir(parents=True)
+        return _Proc()
+
+    monkeypatch.setattr(registry, "wrap_argv", _fake_wrap)
+    monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: cmd)
+    monkeypatch.setattr(registry, "create_subprocess_limited", _fake_spawn)
+    monkeypatch.setattr(registry, "_resolved_clone_commit", lambda root: commit)
+
+    result = await registry._git_fetch_commit(
+        public_url,
+        commit,
+        dest,
+        [],
+        credential_target=raw_url,
+        clone_env={"BASE": "1"},
+        sandbox_mode="strict",
+    )
+
+    assert result is None
+    assert len(wrapped) == len(spawned) == 4
+    assert all(secret not in "\n".join(argv) for argv in wrapped)
+    assert all(secret not in "\n".join(argv) for argv, _ in spawned)
+    assert any(argv[:4] == ["git", "remote", "add", "origin"] for argv in wrapped)
+    assert public_url in "\n".join(part for argv in wrapped for part in argv)
+
+    for argv, kwargs in spawned:
+        process_env = kwargs["env"]
+        assert isinstance(process_env, dict)
+        if "fetch" in argv:
+            count = int(process_env["GIT_CONFIG_COUNT"])
+            assert process_env[f"GIT_CONFIG_KEY_{count - 1}"] == (f"url.{raw_url}.insteadOf")
+            assert process_env[f"GIT_CONFIG_VALUE_{count - 1}"] == public_url
+        else:
+            assert secret not in repr(process_env)
 
 
 @pytest.mark.asyncio
@@ -824,7 +979,9 @@ async def test_provenance_signer_uses_post_script_manifest(monkeypatch, tmp_path
     monkeypatch.setattr(
         registry,
         "install_app",
-        lambda path: MagicMock(ok=True, name="demoapp", message="done", error=""),
+        lambda path, **kwargs: MagicMock(
+            ok=True, name="demoapp", message="done", error=""
+        ),
     )
 
     result = await registry.install_from_registry("demoapp")
@@ -1358,6 +1515,168 @@ class TestApplyTrustFields:
         assert out["provenance"] == "external"
         assert out["verified"] is False
 
+    def test_clone_target_is_server_overwritten_and_prefers_git_url(self):
+        """The modal must show what install will clone, not the legacy alias.
+
+        External rows legitimately carry both fields with different values;
+        ``_entry_git_url`` makes ``gitUrl`` authoritative. An index-supplied
+        ``trustRepository`` is ignored rather than becoming consent authority.
+        """
+        entry = {
+            "name": "external-app",
+            "_registry": "labs",
+            "repo": "https://example.test/display/alias",
+            "gitUrl": "HTTPS://Clone.Example.test/Owner/App.git/",
+            "trustRepository": "https://evil.example/spoof",
+        }
+        (out,) = registry._apply_trust_fields([entry])
+        assert out["trustRepository"] == "https://clone.example.test/Owner/App"
+
+    def test_clone_target_normalization_strips_userinfo_preserves_port_and_path(self):
+        target = "HTTPS://User:SeCrEt@EXAMPLE.COM:08443/Owner/Repo.git/"
+
+        assert registry._normalize_git_target(target) == (
+            "https://example.com:08443/Owner/Repo"
+        )
+
+    def test_clone_target_normalization_handles_ipv6_without_rewriting_authority(self):
+        target = "SSH://Git:T%2FAB@[2001:DB8::A]:2222/Owner/Repo"
+
+        assert registry._normalize_git_target(target) == (
+            "ssh://[2001:db8::a]:2222/Owner/Repo"
+        )
+
+    def test_clone_target_normalization_does_not_fold_query_or_fragment(self):
+        assert registry._normalize_git_target(
+            "HTTPS://EXAMPLE.COM?Ref=Case#Frag"
+        ) == "https://example.com?Ref=Case#Frag"
+
+    def test_clone_target_userinfo_is_not_repository_identity(self):
+        assert registry._same_git_target(
+            "https://User:Secret@EXAMPLE.COM/o/r",
+            "https://user:secret@example.com/o/r",
+        )
+
+    def test_clone_target_scp_userinfo_is_removed_without_folding_path(self):
+        assert registry._normalize_git_target("Git@EXAMPLE.COM:Owner/Repo") == (
+            "EXAMPLE.COM:Owner/Repo"
+        )
+        assert not registry._same_git_target(
+            "Git@EXAMPLE.COM:Owner/Repo", "EXAMPLE.COM:owner/Repo"
+        )
+
+    def test_clone_target_scp_parser_handles_long_unterminated_authority_linearly(self):
+        """An attacker-sized invalid SCP target stays local/unmodified.
+
+        This shape made the former nested/alternating fullmatch backtrack over
+        the entire authority.  The deterministic parser performs only bounded
+        ``find``/scan passes, so increasing the input cannot cause regex DoS.
+        """
+        target = "user@[" + ("a" * 200_000) + ":Owner/Repo"
+
+        assert registry._strip_git_target_userinfo(target) == target
+        assert registry._normalize_git_target(target) == target
+
+    def test_clone_target_ports_are_not_silently_equivalent(self):
+        assert not registry._same_git_target(
+            "https://example.com:8443/o/r",
+            "https://example.com:8444/o/r",
+        )
+        assert not registry._same_git_target(
+            "https://example.com:443/o/r",
+            "https://example.com/o/r",
+        )
+
+    def test_clone_target_ipv6_host_case_is_cosmetic_but_path_case_is_not(self):
+        assert registry._same_git_target(
+            "ssh://git@[2001:DB8::A]:2222/Owner/Repo",
+            "SSH://git@[2001:db8::a]:2222/Owner/Repo",
+        )
+        assert not registry._same_git_target(
+            "ssh://git@[2001:DB8::A]:2222/Owner/Repo",
+            "ssh://git@[2001:db8::a]:2222/owner/Repo",
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            r"C:\Work\Owner\Repo",
+            "/Tmp/Owner/Repo",
+        ],
+    )
+    def test_clone_target_non_uri_forms_are_not_guessed(self, target: str):
+        assert registry._normalize_git_target(target) == target
+
+    def test_clone_target_malformed_unbracketed_ipv6_is_fail_conservative(self):
+        assert registry._normalize_git_target(
+            "SSH://2001:DB8::1/Owner/Repo"
+        ) == "ssh://2001:DB8::1/Owner/Repo"
+
+    def test_clone_target_spoof_is_removed_when_no_repository_resolves(self):
+        entry = {
+            "name": "local-app",
+            "trustRepository": "https://evil.example/spoof",
+        }
+        (out,) = registry._apply_trust_fields([entry])
+        assert "trustRepository" not in out
+
+    def test_storefront_clone_coordinates_never_expose_userinfo(self):
+        secret = "SuperSecret"
+        entry = {
+            "name": "credentialed-app",
+            "gitUrl": f"HTTPS://User:{secret}@Clone.Example.test/Owner/App.git",
+            "repo": f"https://Alias:{secret}@display.example.test/Owner/App",
+        }
+
+        (out,) = registry._apply_trust_fields([entry])
+
+        assert out["trustRepository"] == "https://clone.example.test/Owner/App"
+        assert out["gitUrl"] == "HTTPS://Clone.Example.test/Owner/App.git"
+        assert out["repo"] == "https://display.example.test/Owner/App"
+        assert secret not in str(out)
+
+    def test_legacy_installed_row_uses_current_authoritative_clone_target(self):
+        entry = {
+            "name": "legacy-app",
+            "repo": "https://example.test/display/alias",
+            "gitUrl": "https://clone.example.test/Owner/current-app.git",
+        }
+        installed = {
+            "legacy-app": {
+                "name": "legacy-app",
+                "source": "registry:legacy-app",
+            }
+        }
+
+        bindings = registry._trust_repository_bindings([entry], installed)
+        [out] = registry._apply_trust_fields(
+            [entry], trust_repositories=bindings
+        )
+
+        assert out["trustRepository"] == (
+            "https://clone.example.test/Owner/current-app"
+        )
+
+    def test_local_installed_row_does_not_inherit_same_named_registry_target(self):
+        entry = {
+            "name": "local-app",
+            "gitUrl": "https://clone.example.test/Owner/registry-app.git",
+        }
+        installed = {
+            "local-app": {
+                "name": "local-app",
+                "source": "C:/operator/local-app",
+                "origin": "local",
+            }
+        }
+
+        bindings = registry._trust_repository_bindings([entry], installed)
+        [out] = registry._apply_trust_fields(
+            [entry], trust_repositories=bindings
+        )
+
+        assert "trustRepository" not in out
+
     def test_core_kirocrew_index_author_is_verified(self):
         """``verified`` derives from the INDEX-declared author snapshot
         (``_index_author``, taken by ``list_registry`` pre-merge)."""
@@ -1718,6 +2037,9 @@ class TestCatalogAppsIncludesExternalRegistries:
         # the first-party badge from a document trusted only as far as TLS.
         assert rows["pinned-app"]["provenance"] != "external"
         assert rows["pinned-app"]["verified"] is False
+        assert rows["pinned-app"]["trustRepository"] == (
+            "https://github.com/org/pinned-app"
+        )
         assert "keep-app" in rows
 
     @pytest.mark.asyncio
@@ -1807,7 +2129,15 @@ class TestCatalogAppsIncludesExternalRegistries:
             registry.official_catalog, "list_catalog_rows", lambda: catalog_rows
         )
         monkeypatch.setattr(
-            registry, "_load_registry_file", lambda: [{"name": "seeded-app"}]
+            registry,
+            "_load_registry_file",
+            lambda: [
+                {
+                    "name": "seeded-app",
+                    "repo": "https://example.test/display/alias",
+                    "gitUrl": "https://clone.example.test/owner/seeded-app.git",
+                }
+            ],
         )
         monkeypatch.setattr(registry, "list_installed_apps", lambda: [])
 
@@ -1833,6 +2163,9 @@ class TestCatalogAppsIncludesExternalRegistries:
         rows = {r["name"]: r for r in await registry.list_catalog_apps()}
         assert calls == [], "the seed already answers, so no fetch may be paid"
         assert "seeded-app" in rows
+        assert rows["seeded-app"]["trustRepository"] == (
+            "https://clone.example.test/owner/seeded-app"
+        )
 
 
 # ---------------------------------------------------------------------------

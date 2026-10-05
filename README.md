@@ -354,6 +354,7 @@ make this tool possible:
 <a href="https://github.com/0618" title="MJ Zhang"><img src="https://github.com/0618.png?size=64" width="64" height="64" alt="MJ Zhang" /></a>
 <a href="https://github.com/0V" title="G2"><img src="https://github.com/0V.png?size=64" width="64" height="64" alt="G2" /></a>
 <a href="https://github.com/aahei" title="Ahei"><img src="https://github.com/aahei.png?size=64" width="64" height="64" alt="Ahei" /></a>
+<a href="https://github.com/aahung" title="_sam"><img src="https://github.com/aahung.png?size=64" width="64" height="64" alt="_sam" /></a>
 <a href="https://github.com/abe238" title="Abe Diaz (@abe238)"><img src="https://github.com/abe238.png?size=64" width="64" height="64" alt="Abe Diaz (@abe238)" /></a>
 <a href="https://github.com/abhikarode" title="Abhijit Karode"><img src="https://github.com/abhikarode.png?size=64" width="64" height="64" alt="Abhijit Karode" /></a>
 <a href="https://github.com/abhishekdhameja" title="Abhishek Dhameja"><img src="https://github.com/abhishekdhameja.png?size=64" width="64" height="64" alt="Abhishek Dhameja" /></a>
@@ -564,6 +565,7 @@ make this tool possible:
 <a href="https://github.com/EduVencovsky" title="Eduardo Vencovsky"><img src="https://github.com/EduVencovsky.png?size=64" width="64" height="64" alt="Eduardo Vencovsky" /></a>
 <a href="https://github.com/ekson73" title="Emilson Moraes"><img src="https://github.com/ekson73.png?size=64" width="64" height="64" alt="Emilson Moraes" /></a>
 <a href="https://github.com/el-pedrito" title="Pierre"><img src="https://github.com/el-pedrito.png?size=64" width="64" height="64" alt="Pierre" /></a>
+<a href="https://github.com/eladrkatz" title="Elad Katz"><img src="https://github.com/eladrkatz.png?size=64" width="64" height="64" alt="Elad Katz" /></a>
 <a href="https://github.com/EllaRed" title="Emmanuella Dasilva-Domingos"><img src="https://github.com/EllaRed.png?size=64" width="64" height="64" alt="Emmanuella Dasilva-Domingos" /></a>
 <a href="https://github.com/EllianCarlos" title="Ellian Carlos"><img src="https://github.com/EllianCarlos.png?size=64" width="64" height="64" alt="Ellian Carlos" /></a>
 <a href="https://github.com/elphastori" title="Elphas Toringepi"><img src="https://github.com/elphastori.png?size=64" width="64" height="64" alt="Elphas Toringepi" /></a>
@@ -599,6 +601,7 @@ make this tool possible:
 <a href="https://github.com/Frxnesvo" title="Francesco Gallo"><img src="https://github.com/Frxnesvo.png?size=64" width="64" height="64" alt="Francesco Gallo" /></a>
 <a href="https://github.com/fsiegwald" title="François Siegwald"><img src="https://github.com/fsiegwald.png?size=64" width="64" height="64" alt="François Siegwald" /></a>
 <a href="https://github.com/gabrielmateitoma" title="gabrielmateitoma"><img src="https://github.com/gabrielmateitoma.png?size=64" width="64" height="64" alt="gabrielmateitoma" /></a>
+<a href="https://github.com/galaxicey" title="galaxicey"><img src="https://github.com/galaxicey.png?size=64" width="64" height="64" alt="galaxicey" /></a>
 <a href="https://github.com/Garnethil" title="Gabriel Sanchez"><img src="https://github.com/Garnethil.png?size=64" width="64" height="64" alt="Gabriel Sanchez" /></a>
 <a href="https://github.com/gbrunoo" title="Gabriel"><img src="https://github.com/gbrunoo.png?size=64" width="64" height="64" alt="Gabriel" /></a>
 <a href="https://github.com/geetsawhney" title="geet sawhney"><img src="https://github.com/geetsawhney.png?size=64" width="64" height="64" alt="geet sawhney" /></a>
@@ -642,6 +645,7 @@ make this tool possible:
 <a href="https://github.com/hugoncosta" title="Hugo Costa"><img src="https://github.com/hugoncosta.png?size=64" width="64" height="64" alt="Hugo Costa" /></a>
 <a href="https://github.com/hungtnvu" title="Hung Vu"><img src="https://github.com/hungtnvu.png?size=64" width="64" height="64" alt="Hung Vu" /></a>
 <a href="https://github.com/Huy-OneMedical" title="Huy-OneMedical"><img src="https://github.com/Huy-OneMedical.png?size=64" width="64" height="64" alt="Huy-OneMedical" /></a>
+<a href="https://github.com/Hymian7" title="Lukas M"><img src="https://github.com/Hymian7.png?size=64" width="64" height="64" alt="Lukas M" /></a>
 <a href="https://github.com/iamwhatever" title="Zejiang Guo (Joe)"><img src="https://github.com/iamwhatever.png?size=64" width="64" height="64" alt="Zejiang Guo (Joe)" /></a>
 <a href="https://github.com/ianlenora" title="ianlenora"><img src="https://github.com/ianlenora.png?size=64" width="64" height="64" alt="ianlenora" /></a>
 <a href="https://github.com/icyasblue" title="Angelo Yu"><img src="https://github.com/icyasblue.png?size=64" width="64" height="64" alt="Angelo Yu" /></a>
@@ -879,6 +883,7 @@ make this tool possible:
 <a href="https://github.com/omerfarukaslan" title="Omer Aslan"><img src="https://github.com/omerfarukaslan.png?size=64" width="64" height="64" alt="Omer Aslan" /></a>
 <a href="https://github.com/omerrubi-amzn" title="Omer Rubinstein"><img src="https://github.com/omerrubi-amzn.png?size=64" width="64" height="64" alt="Omer Rubinstein" /></a>
 <a href="https://github.com/OnlyOneByte" title="Rengang (Angelo) Yang"><img src="https://github.com/OnlyOneByte.png?size=64" width="64" height="64" alt="Rengang (Angelo) Yang" /></a>
+<a href="https://github.com/OnTheNose204" title="OnTheNose204"><img src="https://github.com/OnTheNose204.png?size=64" width="64" height="64" alt="OnTheNose204" /></a>
 <a href="https://github.com/ophilli" title="Owen Phillips"><img src="https://github.com/ophilli.png?size=64" width="64" height="64" alt="Owen Phillips" /></a>
 <a href="https://github.com/parimaldeshmukh" title="Parimal Deshmukh"><img src="https://github.com/parimaldeshmukh.png?size=64" width="64" height="64" alt="Parimal Deshmukh" /></a>
 <a href="https://github.com/pasard" title="Patrick Sard"><img src="https://github.com/pasard.png?size=64" width="64" height="64" alt="Patrick Sard" /></a>
@@ -1047,6 +1052,7 @@ make this tool possible:
 <a href="https://github.com/tarikermis" title="Tarik Ermis"><img src="https://github.com/tarikermis.png?size=64" width="64" height="64" alt="Tarik Ermis" /></a>
 <a href="https://github.com/tbelmega" title="Thiemo Belmega"><img src="https://github.com/tbelmega.png?size=64" width="64" height="64" alt="Thiemo Belmega" /></a>
 <a href="https://github.com/TeeboBaggens" title="Teebo Baggens"><img src="https://github.com/TeeboBaggens.png?size=64" width="64" height="64" alt="Teebo Baggens" /></a>
+<a href="https://github.com/teruokun" title="Jeff Edwards"><img src="https://github.com/teruokun.png?size=64" width="64" height="64" alt="Jeff Edwards" /></a>
 <a href="https://github.com/texnewmex" title="Nolan Clayton"><img src="https://github.com/texnewmex.png?size=64" width="64" height="64" alt="Nolan Clayton" /></a>
 <a href="https://github.com/th3l4ughingm4n" title="th3l4ughingm4n"><img src="https://github.com/th3l4ughingm4n.png?size=64" width="64" height="64" alt="th3l4ughingm4n" /></a>
 <a href="https://github.com/the-mann" title="Marcus Mann"><img src="https://github.com/the-mann.png?size=64" width="64" height="64" alt="Marcus Mann" /></a>
